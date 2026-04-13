@@ -523,8 +523,8 @@ void setup() {
     xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, nullptr, 5, nullptr, 0);
     Serial.println("[BOOT] audioTask gestartet (Core 0)");
 
+    WiFi.setSleep(false);   // Power-Save VOR setupWiFi() – verhindert kurzzeitigen Routenverlust
     setupWiFi();
-    WiFi.setSleep(false);   // Power-Save abschalten → kein kurzzeitiger Routenverlust
 
     if (serverReachable()) {
         Serial.println("[BOOT] Server erreichbar");
