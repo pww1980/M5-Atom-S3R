@@ -55,6 +55,17 @@ def _build_wav_header(pcm_len: int) -> bytes:
 # =============================================================================
 class _UploadHandler(BaseHTTPRequestHandler):
 
+    def do_GET(self):
+        if self.path != '/hello':
+            self.send_error(404, 'Not Found')
+            return
+        device_ip = self.headers.get('X-Device-IP', self.client_address[0])
+        logger.info(f"[HTTP] Gerät meldet sich: {device_ip}")
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'OK')
+
     def do_POST(self):
         if self.path != '/upload':
             self.send_error(404, 'Not Found')
