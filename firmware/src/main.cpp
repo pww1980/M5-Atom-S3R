@@ -312,8 +312,17 @@ void stopCapture() {
         Serial.println("[MIC] Warnung: audioTask wurde nicht rechtzeitig idle");
     }
 
-    while (M5.Mic.isRecording()) {
-        M5.delay(1);
+    // Zweite Absicherung: isRecording() sollte nach M5.Mic.end() (unten) false werden.
+    // Mit Timeout gegen einen Hardware-/DMA-Hänger absichern.
+    {
+        unsigned long tStart = millis();
+        while (M5.Mic.isRecording()) {
+            if (millis() - tStart > 500) {
+                Serial.println("[MIC] WARNUNG: isRecording() bleibt true – Hardware-Hänger?");
+                break;
+            }
+            M5.delay(1);
+        }
     }
 
     M5.Mic.end();
@@ -424,6 +433,7 @@ void finishRecording() {
         // Keine Verbindung → DONE kann nicht gesendet werden, ACK kommt nie.
         // Direkt nach IDLE statt 30s auf Timeout zu warten.
         Serial.println("[BTN] Kein WS – Aufnahme verworfen");
+        ws.disconnect();    // Library-Zustand sauber zurücksetzen
         beepPattern(600, 80, 80, 3);
         currentState = IDLE;
     }
@@ -459,15 +469,22 @@ void handleReconnecting() {
         uint8_t tmp[AUDIO_BUF_BYTES];
         uint32_t n;
 
-        while ((n = psramBufRead(tmp, AUDIO_BUF_BYTES)) > 0) {
+        // wsConnected in der Schleifenbedingung prüfen:
+        // bricht die Verbindung während des PSRAM-Flushes ab, wird die Schleife
+        // sauber verlassen statt blind weiterzusenden.
+        while ((n = psramBufRead(tmp, AUDIO_BUF_BYTES)) > 0 && wsConnected) {
             ws.sendBIN(tmp, n);
             ws.loop();
         }
 
-        reconnectAttempts = 0;
-        currentState = RECORDING;
-        Serial.println("[RECONNECT] Wiederverbunden");
-        return;
+        if (wsConnected) {
+            reconnectAttempts = 0;
+            currentState = RECORDING;
+            Serial.println("[RECONNECT] Wiederverbunden");
+            return;
+        }
+        // Verbindung während Flush verloren → weiter zum Max-Attempts-Check unten.
+        Serial.println("[RECONNECT] Verbindung während PSRAM-Flush verloren");
     }
 
     if (reconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
