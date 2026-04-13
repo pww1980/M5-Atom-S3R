@@ -217,6 +217,7 @@ void stopCapture() {
 
     M5.Mic.end();
     drainFilledQueue();
+    delay(150);          // DAC settle – verhindert Fiepen beim Umschalten Mic→Speaker
     M5.Speaker.begin();
     Serial.println("[MIC] Aufnahme gestoppt");
 }
