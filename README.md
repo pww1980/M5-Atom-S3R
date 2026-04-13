@@ -25,7 +25,34 @@ Sprachaufnahme per Knopfdruck auf dem M5Stack Atom VoiceS3R, automatische Transk
 
 ---
 
-### 1. Firmware (ESP32-S3)
+### 1. PlatformIO installieren
+
+PlatformIO läuft auf Windows und Linux gleichermaßen gut. Nimm die Umgebung, die du bereits nutzt – wenn du den N100-Server sowieso unter Linux betreibst, kannst du auch dort flashen.
+
+#### Weg 1: VS Code + Extension (empfohlen)
+
+1. **VS Code** installieren: [code.visualstudio.com](https://code.visualstudio.com/)
+2. In VS Code: `Ctrl+Shift+X` → nach **PlatformIO IDE** suchen → installieren
+3. VS Code neu starten → PlatformIO-Icon erscheint in der linken Leiste
+
+#### Weg 2: CLI (ohne VS Code)
+
+```bash
+pip install platformio
+```
+
+#### Linux: USB-Rechte einmalig setzen
+
+Damit PlatformIO ohne `sudo` auf den USB-Port zugreifen darf:
+
+```bash
+sudo usermod -aG dialout $USER
+# Danach neu einloggen (oder: newgrp dialout)
+```
+
+---
+
+### 2. Firmware (ESP32-S3)
 
 ```bash
 # Repository klonen
@@ -36,8 +63,10 @@ cd M5-Atom-S3R/firmware
 pio run -t upload
 
 # Seriellen Monitor öffnen (optional, für Debugging)
-pio device monitor
+pio device monitor --baud 115200
 ```
+
+> Beim ersten Build lädt PlatformIO automatisch alle Libraries (`M5Unified`, `WebSockets`, `WiFiManager`) und die ESP32-S3-Toolchain herunter – das dauert einmalig ca. 2–3 Minuten.
 
 Die Firmware trägt sich selbst ins WLAN ein – keine Zugangsdaten im Code nötig (siehe Abschnitt **Ersteinrichtung** unter Bedienung).
 
@@ -45,15 +74,15 @@ Die Firmware trägt sich selbst ins WLAN ein – keine Zugangsdaten im Code nöt
 
 ---
 
-### 2. Server-Backend (Python)
+### 3. Server-Backend (Python)
 
-#### 2a. Systempakete
+#### 3a. Systempakete
 
 ```bash
 sudo apt install ffmpeg
 ```
 
-#### 2b. Python-Umgebung
+#### 3b. Python-Umgebung
 
 ```bash
 cd transcription-server
@@ -64,14 +93,14 @@ pip install -r requirements.txt
 
 > Die erste Installation dauert ca. 5–10 Minuten (PyTorch + pyannote).
 
-#### 2c. Ollama installieren
+#### 3c. Ollama installieren
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ollama pull mistral
 ```
 
-#### 2d. Konfiguration (`config.py`)
+#### 3d. Konfiguration (`config.py`)
 
 ```python
 PYANNOTE_TOKEN    = "hf_..."   # HuggingFace Token (s. unten)
@@ -84,14 +113,14 @@ TELEGRAM_CHAT_ID   = "..."     # Telegram Chat-ID
 2. Modell-Lizenz akzeptieren: [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
 3. Token unter *Settings → Access Tokens* erstellen und in `config.py` eintragen
 
-#### 2e. Server starten
+#### 3e. Server starten
 
 ```bash
 source venv/bin/activate
 python main.py
 ```
 
-#### 2f. Autostart (systemd, optional)
+#### 3f. Autostart (systemd, optional)
 
 ```bash
 sudo nano /etc/systemd/system/transcription.service
@@ -117,7 +146,7 @@ sudo systemctl enable transcription
 sudo systemctl start transcription
 ```
 
-#### 2g. Netzwerk
+#### 3g. Netzwerk
 
 - Den Server-Rechner im Router eine **feste IP** vergeben (DHCP-Reservierung per MAC).
 - Port `8765` muss im lokalen Netz erreichbar sein – kein externer Zugriff erforderlich.
