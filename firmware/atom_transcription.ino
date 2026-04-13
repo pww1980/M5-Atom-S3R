@@ -2,16 +2,22 @@
  * Atom Echo S3R – Transkriptions-Pipeline Firmware
  *
  * Hardware:  M5Stack Atom VoiceS3R / Atom EchoS3R
- * MCU:       ESP32-S3
+ * MCU:       ESP32-S3 (Dual-Core LX7)
  * Codec:     ES8311  (via M5Unified)
  * Button:    GPIO 41
  * LED:       keine
  *
- * WiFi-Einrichtung: Beim ersten Start (oder nach Reset) öffnet das Gerät
- * einen WLAN-Hotspot "Atom-Transcription-Setup". Dort im Browser unter
- * 192.168.4.1 SSID, Passwort und Server-IP eintragen.
+ * FreeRTOS-Architektur:
+ *   Core 0 – audioTask : liest I2S-DMA, befüllt Buffer-Pool → filledQueue
+ *   Core 1 – loop()    : leert filledQueue, sendet via WebSocket oder PSRAM
  *
- * Zustände: IDLE → RECORDING → PROCESSING → DONE / ERROR / RECONNECTING
+ * WiFi-Einrichtung: Beim ersten Start öffnet das Gerät den Hotspot
+ * "Atom-Transcription-Setup". Im Browser 192.168.4.1 aufrufen,
+ * WLAN-Zugangsdaten + Server-IP eintragen.
+ *
+ * Zustände: IDLE → RECORDING → PROCESSING
+ *                     ↕
+ *                RECONNECTING
  */
 
 #include <M5Unified.h>
@@ -29,27 +35,115 @@
 #define AUDIO_BUF_SAMPLES           512
 #define AUDIO_BUF_BYTES             (AUDIO_BUF_SAMPLES * 2)
 
+// Buffer-Pool: 16 × 1 KB = 16 KB im SRAM
+// → ~512 ms Puffer zwischen audioTask und loop()
+#define AUDIO_POOL_SIZE             16
+
 #define BUTTON_PIN                  41
 #define BUTTON_DEBOUNCE_MS          50
 #define LONG_PRESS_MS               3000
-#define PORTAL_RESET_HOLD_MS        5000   // 5s Druck im IDLE → WiFi-Reset
+#define PORTAL_RESET_HOLD_MS        5000
 
 #define PSRAM_BUFFER_MAX_BYTES      (4 * 1024 * 1024)
 #define WIFI_RECONNECT_INTERVAL_MS  2000
 #define WIFI_RECONNECT_MAX_ATTEMPTS 30
 
 // =============================================================================
-// Globaler Zustand
+// Zustandsmaschine
 // =============================================================================
-enum State { IDLE, RECORDING, RECONNECTING, PROCESSING, DONE, ERROR_STATE };
-State currentState = IDLE;
+enum State { IDLE, RECORDING, RECONNECTING, PROCESSING };
+volatile State currentState = IDLE;
 
-char serverIP[40] = "192.168.x.x";   // wird aus NVS geladen oder per Portal gesetzt
-
+char serverIP[40] = "192.168.x.x";
 Preferences prefs;
 
 // =============================================================================
-// Pieptöne
+// FreeRTOS Audio-Buffer-Pool + Queues
+//
+//  freeQueue  ──►  audioTask (befüllt)  ──►  filledQueue  ──►  loop() (sendet)
+//                                                                    │
+//                                              freeQueue  ◄──────────┘
+// =============================================================================
+static int16_t   audioPool[AUDIO_POOL_SIZE][AUDIO_BUF_SAMPLES];
+static QueueHandle_t freeQueue   = nullptr;   // leere Puffer
+static QueueHandle_t filledQueue = nullptr;   // befüllte Puffer, bereit zum Senden
+
+volatile bool audioCapturing = false;   // steuert audioTask
+
+void audioQueuesInit() {
+    freeQueue   = xQueueCreate(AUDIO_POOL_SIZE, sizeof(int16_t*));
+    filledQueue = xQueueCreate(AUDIO_POOL_SIZE, sizeof(int16_t*));
+    // Alle Puffer in den Free-Pool legen
+    for (int i = 0; i < AUDIO_POOL_SIZE; i++) {
+        int16_t* ptr = audioPool[i];
+        xQueueSend(freeQueue, &ptr, 0);
+    }
+}
+
+// Gefüllte Queue leeren, Puffer zurück in Free-Pool
+void drainFilledQueue() {
+    int16_t* buf;
+    while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE)
+        xQueueSend(freeQueue, &buf, 0);
+}
+
+// =============================================================================
+// audioTask – läuft auf Core 0, hohe Priorität
+// =============================================================================
+void audioTask(void* /*param*/) {
+    for (;;) {
+        if (!audioCapturing) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        int16_t* buf = nullptr;
+        // Freien Puffer holen (max. 50 ms warten)
+        if (xQueueReceive(freeQueue, &buf, pdMS_TO_TICKS(50)) != pdTRUE)
+            continue;
+
+        // Blocking record: kehrt zurück wenn DMA-Puffer voll (~32 ms bei 512 Samples)
+        if (M5.Mic.record(buf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, true)
+            && audioCapturing)
+        {
+            // Puffer in filledQueue – falls voll (Sender zu langsam), Puffer verwerfen
+            if (xQueueSend(filledQueue, &buf, 0) != pdTRUE) {
+                Serial.println("[AUDIO] filledQueue voll – Chunk verworfen");
+                xQueueSend(freeQueue, &buf, 0);
+            }
+        } else {
+            // Aufnahme gestoppt oder fehlgeschlagen → Puffer freigeben
+            xQueueSend(freeQueue, &buf, 0);
+        }
+    }
+}
+
+// =============================================================================
+// Mic starten / stoppen
+// =============================================================================
+void startCapture() {
+    auto mic_cfg          = M5.Mic.config();
+    mic_cfg.sample_rate   = AUDIO_SAMPLE_RATE;
+    mic_cfg.stereo        = false;
+    mic_cfg.dma_buf_count = 8;
+    mic_cfg.dma_buf_len   = AUDIO_BUF_SAMPLES;
+    M5.Mic.config(mic_cfg);
+    M5.Mic.begin();
+    audioCapturing = true;
+    Serial.println("[MIC] Aufnahme gestartet");
+}
+
+void stopCapture() {
+    audioCapturing = false;
+    delay(60);          // audioTask beendet laufenden record()-Aufruf (~32 ms)
+    M5.Mic.end();
+    drainFilledQueue(); // restliche Puffer zurück in Free-Pool
+    M5.Speaker.begin();
+    Serial.println("[MIC] Aufnahme gestoppt");
+}
+
+// =============================================================================
+// Pieptöne (nur wenn Speaker aktiv, d. h. Mic gestoppt)
 // =============================================================================
 void beepPattern(uint16_t freqHz, uint32_t tonMs, uint32_t pauseMs, uint8_t count) {
     for (uint8_t i = 0; i < count; i++) {
@@ -61,40 +155,32 @@ void beepPattern(uint16_t freqHz, uint32_t tonMs, uint32_t pauseMs, uint8_t coun
 }
 
 // =============================================================================
-// WiFi-Setup (WiFiManager + benutzerdefinierter Parameter für Server-IP)
+// WiFi-Setup (WiFiManager + Server-IP-Parameter)
 // =============================================================================
-WiFiManager       wm;
-char              savedIP[40];
-bool              shouldSaveParams = false;
-WiFiManagerParameter* paramServerIP = nullptr;
+WiFiManager           wm;
+char                  savedIP[40];
+bool                  shouldSaveParams = false;
+WiFiManagerParameter* paramServerIP   = nullptr;
 
 void saveParamsCallback() { shouldSaveParams = true; }
 
 void setupWiFi(bool forcePortal = false) {
-    // Server-IP aus NVS laden
     prefs.begin("atom", true);
     String ip = prefs.getString("server_ip", "192.168.x.x");
     prefs.end();
     ip.toCharArray(savedIP, sizeof(savedIP));
 
-    // Eigenen Parameter für Server-IP zur Portal-Seite hinzufügen
     delete paramServerIP;
     paramServerIP = new WiFiManagerParameter("server_ip", "Server-IP (N100)", savedIP, 39);
     wm.addParameter(paramServerIP);
     wm.setSaveParamsCallback(saveParamsCallback);
-
-    // Hotspot-Name und Timeout
     wm.setAPName("Atom-Transcription-Setup");
-    wm.setConfigPortalTimeout(180);   // 3 Minuten, dann Neustart
+    wm.setConfigPortalTimeout(180);
     wm.setConnectTimeout(15);
 
-    bool ok;
-    if (forcePortal) {
-        Serial.println("[WIFI] Portal manuell geöffnet");
-        ok = wm.startConfigPortal("Atom-Transcription-Setup");
-    } else {
-        ok = wm.autoConnect("Atom-Transcription-Setup");
-    }
+    bool ok = forcePortal
+        ? wm.startConfigPortal("Atom-Transcription-Setup")
+        : wm.autoConnect("Atom-Transcription-Setup");
 
     if (!ok) {
         Serial.println("[WIFI] Verbindung fehlgeschlagen – Neustart");
@@ -103,7 +189,6 @@ void setupWiFi(bool forcePortal = false) {
         ESP.restart();
     }
 
-    // Gespeicherte Parameter übernehmen
     if (shouldSaveParams) {
         const char* val = paramServerIP->getValue();
         prefs.begin("atom", false);
@@ -114,13 +199,12 @@ void setupWiFi(bool forcePortal = false) {
     } else {
         strncpy(serverIP, savedIP, sizeof(serverIP));
     }
-
-    Serial.printf("[WIFI] Verbunden. Gerät-IP: %s  Server: %s\n",
+    Serial.printf("[WIFI] Verbunden. IP: %s  Server: %s\n",
                   WiFi.localIP().toString().c_str(), serverIP);
 }
 
 // =============================================================================
-// Server-Erreichbarkeitstest (TCP-only)
+// Server-Erreichbarkeitstest
 // =============================================================================
 bool serverReachable() {
     WiFiClient c;
@@ -130,7 +214,7 @@ bool serverReachable() {
 }
 
 // =============================================================================
-// PSRAM-Ringpuffer
+// PSRAM-Ringpuffer (für Offline-Pufferung bei WLAN-Abbruch)
 // =============================================================================
 uint8_t* psramBuf  = nullptr;
 uint32_t psramHead = 0;
@@ -175,8 +259,8 @@ uint32_t psramBufRead(uint8_t* out, uint32_t maxLen) {
 // WebSocket
 // =============================================================================
 WebSocketsClient ws;
-bool wsConnected   = false;
-bool wsAckReceived = false;
+volatile bool wsConnected   = false;
+volatile bool wsAckReceived = false;
 
 void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
@@ -211,12 +295,14 @@ bool wsConnect() {
 // =============================================================================
 int           reconnectAttempts   = 0;
 unsigned long lastReconnectMillis = 0;
-int16_t       audioBuf[AUDIO_BUF_SAMPLES];
 
 void handleReconnecting() {
-    // Aufnahme läuft weiter, Chunks in PSRAM puffern
-    if (M5.Mic.record(audioBuf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, false))
-        psramBufWrite((uint8_t*)audioBuf, AUDIO_BUF_BYTES);
+    // Befüllte Queue → PSRAM (audioTask läuft weiter)
+    int16_t* buf;
+    while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE) {
+        psramBufWrite((uint8_t*)buf, AUDIO_BUF_BYTES);
+        xQueueSend(freeQueue, &buf, 0);
+    }
 
     unsigned long now = millis();
     if (now - lastReconnectMillis < WIFI_RECONNECT_INTERVAL_MS) return;
@@ -227,7 +313,7 @@ void handleReconnecting() {
     if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
 
     if (WiFi.status() == WL_CONNECTED && wsConnect()) {
-        // PSRAM-Puffer senden, dann live weiterstreamen
+        // PSRAM-Puffer zuerst senden, dann live weiterstreamen
         uint8_t tmp[AUDIO_BUF_BYTES];
         uint32_t n;
         while ((n = psramBufRead(tmp, AUDIO_BUF_BYTES)) > 0) {
@@ -242,8 +328,7 @@ void handleReconnecting() {
 
     if (reconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
         Serial.println("[RECONNECT] Timeout – Aufnahme abgebrochen");
-        M5.Mic.end();
-        M5.Speaker.begin();
+        stopCapture();
         beepPattern(600, 80, 80, 5);
         currentState      = IDLE;
         reconnectAttempts = 0;
@@ -256,22 +341,32 @@ void handleReconnecting() {
 void setup() {
     Serial.begin(115200);
     delay(300);
+    Serial.println("[BOOT] Atom VoiceS3R startet");
 
-    // M5Unified (verwaltet ES8311, I2S, I2C intern)
     auto cfg = M5.config();
     M5.begin(cfg);
-
     M5.Speaker.setVolume(200);
     M5.Speaker.begin();
 
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
     psramBufInit();
+    audioQueuesInit();
 
-    // WiFi + Server-IP konfigurieren (blockiert bis verbunden)
+    // audioTask auf Core 0, Priorität 5 (höher als loop auf Core 1)
+    xTaskCreatePinnedToCore(
+        audioTask,          // Funktion
+        "audioTask",        // Name (Debugging)
+        4096,               // Stack-Größe in Bytes
+        nullptr,            // Parameter
+        5,                  // Priorität
+        nullptr,            // Task-Handle (nicht benötigt)
+        0                   // Core 0
+    );
+    Serial.println("[BOOT] audioTask gestartet (Core 0)");
+
     setupWiFi();
 
-    // Server-Erreichbarkeit prüfen
     if (serverReachable()) {
         Serial.println("[BOOT] Server erreichbar");
         beepPattern(1000, 80, 80, 2);   // 2× kurz → OK
@@ -285,36 +380,19 @@ void setup() {
 }
 
 // =============================================================================
-// Loop
+// Loop (Core 1)
 // =============================================================================
 bool          lastButtonState  = HIGH;
 unsigned long pressStartMillis = 0;
 bool          longPressHandled = false;
 
-void startMic() {
-    M5.Speaker.end();
-    auto mic_cfg            = M5.Mic.config();
-    mic_cfg.sample_rate     = AUDIO_SAMPLE_RATE;
-    mic_cfg.stereo          = false;
-    mic_cfg.dma_buf_count   = 8;
-    mic_cfg.dma_buf_len     = AUDIO_BUF_SAMPLES;
-    M5.Mic.config(mic_cfg);
-    M5.Mic.begin();
-}
-
-void stopMic() {
-    M5.Mic.end();
-    M5.Speaker.begin();
-}
-
 void loop() {
     M5.update();
     ws.loop();
 
+    // ---- Button ----
     bool btn = digitalRead(BUTTON_PIN);
-    unsigned long now = millis();
 
-    // Flanke gedrückt
     if (btn == LOW && lastButtonState == HIGH) {
         delay(BUTTON_DEBOUNCE_MS);
         if (digitalRead(BUTTON_PIN) == LOW) {
@@ -323,11 +401,11 @@ void loop() {
         }
     }
 
-    // Langer Druck im IDLE (≥5s) → WiFi-Portal zurücksetzen
+    // Langer Druck im IDLE (≥5s) → WiFi zurücksetzen
     if (btn == LOW && !longPressHandled && currentState == IDLE) {
         if (millis() - pressStartMillis >= PORTAL_RESET_HOLD_MS) {
             longPressHandled = true;
-            Serial.println("[BTN] WiFi-Reset – Portal öffnet sich");
+            Serial.println("[BTN] WiFi-Reset");
             beepPattern(1000, 200, 100, 2);
             wm.resetSettings();
             delay(500);
@@ -339,59 +417,58 @@ void loop() {
     if (btn == LOW && !longPressHandled && currentState == RECORDING) {
         if (millis() - pressStartMillis >= LONG_PRESS_MS) {
             longPressHandled = true;
-            Serial.println("[BTN] Langer Druck – Aufnahme abgebrochen");
-            stopMic();
+            Serial.println("[BTN] Aufnahme abgebrochen");
+            stopCapture();
             ws.disconnect();
             currentState = IDLE;
         }
     }
 
-    // Kurzer Druck (Loslassen)
+    // Kurzer Druck
     if (btn == HIGH && lastButtonState == LOW && !longPressHandled) {
 
         if (currentState == IDLE) {
+            // Erst WS verbinden (Speaker noch aktiv), dann piepen, dann Mic starten
             Serial.println("[BTN] Start Aufnahme");
-            // Erst WS verbinden, dann piepen (Speaker läuft noch), dann Mic starten
             if (wsConnect()) {
-                beepPattern(1000, 100, 0, 1);   // 1× 1000Hz 100ms → Aufnahme startet
-                startMic();                      // Speaker.end() + Mic.begin()
+                beepPattern(1000, 100, 0, 1);   // 1× 1000 Hz → Aufnahme läuft
+                M5.Speaker.end();
                 psramBufReset();
                 reconnectAttempts   = 0;
                 lastReconnectMillis = 0;
-                currentState        = RECORDING;
+                startCapture();
+                currentState = RECORDING;
             } else {
                 Serial.println("[BTN] WebSocket fehlgeschlagen");
-                beepPattern(600, 80, 80, 5);    // 5× 600Hz → Verbindungsfehler
-                currentState = IDLE;
+                beepPattern(600, 80, 80, 5);    // 5× 600 Hz → Fehler
             }
 
         } else if (currentState == RECORDING) {
             Serial.println("[BTN] Stopp Aufnahme");
-            if (M5.Mic.record(audioBuf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, false) && wsConnected)
-                ws.sendBIN((uint8_t*)audioBuf, AUDIO_BUF_BYTES);
-            stopMic();
+            stopCapture();              // audioTask pausiert, Mic aus, Speaker an
             ws.disconnect();
-            delay(100);
-            beepPattern(1000, 80, 60, 3);   // 3× kurz → Aufnahme gestoppt
+            beepPattern(1000, 80, 60, 3);   // 3× 1000 Hz → Verarbeitung läuft
             wsAckReceived = false;
             currentState  = PROCESSING;
         }
     }
     lastButtonState = btn;
 
-    // Audio streamen (RECORDING)
+    // ---- Audio senden (RECORDING) ----
+    // filledQueue leeren und direkt per WebSocket senden
     if (currentState == RECORDING && wsConnected) {
-        if (M5.Mic.record(audioBuf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, false))
-            ws.sendBIN((uint8_t*)audioBuf, AUDIO_BUF_BYTES);
+        int16_t* buf;
+        while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE) {
+            ws.sendBIN((uint8_t*)buf, AUDIO_BUF_BYTES);
+            xQueueSend(freeQueue, &buf, 0);     // Puffer sofort zurückgeben
+        }
     }
 
-    // Puffern + Reconnect (RECONNECTING)
+    // ---- PSRAM puffern + Reconnect (RECONNECTING) ----
     if (currentState == RECONNECTING)
         handleReconnecting();
 
-    // Warten auf Server-ACK (PROCESSING)
-    // Kein weiterer Piep nötig – die 3× beim Stopp signalisieren bereits Ende der Aufnahme.
-    // Der ACK bestätigt nur intern die erfolgreiche Übergabe an den Server.
+    // ---- Warten auf ACK (PROCESSING) ----
     if (currentState == PROCESSING && wsAckReceived) {
         Serial.println("[PIPELINE] Server hat Job übernommen");
         currentState = IDLE;
