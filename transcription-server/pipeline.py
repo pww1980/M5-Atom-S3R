@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 
 def _session_name_from_path(wav_path: str) -> str:
-    return os.path.basename(wav_path).replace("_audio.wav", "")
+    # Dateiname: atom_YYYY_MM_DD_HH_MM.wav  (aus /tmp/)
+    return os.path.basename(wav_path).removeprefix("atom_").removesuffix(".wav")
 
 
 def _write_transcript_md(session_name: str, transcript: str,
@@ -84,12 +85,13 @@ def _write_summary_md(session_name: str, summary: str,
     return path
 
 
-def _convert_to_ogg(wav_path: str) -> str:
+def _convert_to_ogg(wav_path: str, session_name: str) -> str:
     """
-    Konvertiert WAV → OGG/Opus mit ffmpeg.
+    Konvertiert WAV (aus /tmp/) → OGG/Opus in output/.
     Löscht WAV nur wenn OGG > 0 Bytes.
     """
-    ogg_path = wav_path.replace("_audio.wav", "_audio.ogg")
+    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+    ogg_path = os.path.join(config.OUTPUT_DIR, f"{session_name}_audio.ogg")
     cmd = [
         "ffmpeg", "-y", "-i", wav_path,
         "-c:a", "libopus", "-b:a", "32k",
@@ -109,7 +111,7 @@ def _convert_to_ogg(wav_path: str) -> str:
         return ogg_path
     except Exception as e:
         logger.error(f"[PIPELINE] OGG-Konvertierung fehlgeschlagen: {e}")
-        return wav_path  # WAV bleibt erhalten
+        return wav_path  # WAV bleibt als Fallback erhalten
 
 
 def run_pipeline(wav_path: str):
@@ -186,9 +188,9 @@ def run_pipeline(wav_path: str):
     except Exception as e:
         logger.error(f"[PIPELINE] Summary-MD Fehler: {e}")
 
-    # 7+8. WAV → OGG
+    # 7+8. WAV (aus /tmp/) → OGG (nach output/)
     try:
-        _convert_to_ogg(wav_path)
+        _convert_to_ogg(wav_path, session_name)
     except Exception as e:
         logger.error(f"[PIPELINE] OGG-Fehler: {e}")
 

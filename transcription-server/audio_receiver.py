@@ -6,6 +6,7 @@ import asyncio
 import logging
 import struct
 import os
+import tempfile
 from datetime import datetime
 
 import websockets
@@ -83,9 +84,8 @@ async def handle_connection(websocket):
                 pass
         return
 
-    # WAV schreiben
-    os.makedirs(config.OUTPUT_DIR, exist_ok=True)
-    wav_path = os.path.join(config.OUTPUT_DIR, f"{session_name}_audio.wav")
+    # WAV als temporäre Datei schreiben – output/ bleibt für Endergebnisse reserviert
+    wav_path = os.path.join(tempfile.gettempdir(), f"atom_{session_name}.wav")
 
     with open(wav_path, 'wb') as f:
         f.write(_build_wav_header(len(pcm_data)))
