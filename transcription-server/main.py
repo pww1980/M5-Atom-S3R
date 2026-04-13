@@ -26,39 +26,42 @@ logger = logging.getLogger(__name__)
 
 
 # =============================================================================
-# Graceful Shutdown
-# =============================================================================
-shutdown_event = asyncio.Event()
-
-
-def _handle_signal(signum, frame):
-    logger.info(f"[MAIN] Signal {signum} – Server wird beendet")
-    shutdown_event.set()
-
-
-# =============================================================================
 # Hauptfunktion
 # =============================================================================
 async def main():
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     logger.info(f"[MAIN] Output-Verzeichnis: {os.path.abspath(config.OUTPUT_DIR)}")
 
+    loop = asyncio.get_event_loop()
+
+    # Signal-Handler im asyncio-Kontext registrieren (Linux/macOS only).
+    # Dadurch wird shutdown_event.set() sicher aus dem Event-Loop heraus aufgerufen,
+    # ohne den httpd.shutdown()-Block zu treffen.
+    shutdown_event = asyncio.Event()
+
+    def _shutdown():
+        logger.info("[MAIN] Signal empfangen – Server wird beendet")
+        shutdown_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, _shutdown)
+
     # Event-Loop an http_receiver übergeben (für spätere Pipeline-Integration)
-    http_receiver._event_loop = asyncio.get_event_loop()
+    http_receiver._event_loop = loop
 
     httpd = http_receiver.start_server()
     logger.info("[MAIN] Server läuft. Warte auf Verbindungen ...")
 
     await shutdown_event.wait()
 
-    httpd.shutdown()
+    # server_close() schließt den Socket sofort.
+    # Der Daemon-Thread (serve_forever) endet automatisch beim nächsten
+    # select()-Timeout (≤ 0,5 s) – kein blockierendes shutdown() nötig.
+    httpd.server_close()
     logger.info("[MAIN] Server beendet")
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT,  _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
