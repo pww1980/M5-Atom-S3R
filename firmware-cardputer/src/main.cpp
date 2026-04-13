@@ -90,7 +90,7 @@ void dispIdle() {
     M5.Display.print(sdReady ? "OK" : "fehlt!");
     M5.Display.setTextColor(CLR_GREEN, CLR_BG);
     M5.Display.setCursor(10, 100);
-    M5.Display.print("[Taste] Aufnahme starten");
+    M5.Display.print("[OK] Aufnahme starten");
 }
 
 void dispRecording(uint32_t elapsedSec) {
@@ -112,7 +112,7 @@ void dispRecording(uint32_t elapsedSec) {
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(CLR_GRAY, CLR_BG);
     M5.Display.setCursor(10, 118);
-    M5.Display.print("[Taste] Aufnahme stoppen");
+    M5.Display.print("[OK] Aufnahme stoppen");
 }
 
 void dispConfirm(uint32_t remainingSec) {
@@ -136,7 +136,7 @@ void dispConfirm(uint32_t remainingSec) {
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(CLR_GREEN, CLR_BG);
     M5.Display.setCursor(10, 118);
-    M5.Display.print("[Taste]=Senden  [Timeout]=Nur SD");
+    M5.Display.print("[OK]=Senden  [Timeout]=Nur SD");
 }
 
 void dispUploading(uint32_t pcmKB) {
@@ -496,10 +496,15 @@ void loop() {
         }
     }
 
-    // --- Button (BtnA / OK-Taste) ---------------------------------------------
-    if (M5.BtnA.wasPressed()) btnDownAt = millis();
+    // --- OK-Taste (Cardputer Keyboard) ----------------------------------------
+    static bool okPrev = false;
+    bool okNow = M5.Keyboard.keysState().enter;
 
-    if (M5.BtnA.wasReleased()) {
+    if (okNow && !okPrev) {
+        btnDownAt = millis();
+    }
+
+    if (!okNow && okPrev) {
         uint32_t held = millis() - btnDownAt;
 
         if (held >= LONG_PRESS_MS && currentState == IDLE) {
@@ -524,4 +529,6 @@ void loop() {
         }
         // UPLOADING: ignorieren
     }
+
+    okPrev = okNow;
 }

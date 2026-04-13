@@ -196,11 +196,11 @@ sudo systemctl start transcription
 
 | Aktion | Zustand | Ergebnis |
 |---|---|---|
-| Kurz drücken | Bereit | Aufnahme starten |
-| Kurz drücken | Aufnahme läuft | Aufnahme stoppen |
-| Kurz drücken | "Senden?"-Bildschirm | Upload starten |
+| **OK** drücken | Bereit | Aufnahme starten |
+| **OK** drücken | Aufnahme läuft | Aufnahme stoppen |
+| **OK** drücken | "Senden?"-Bildschirm | Upload starten |
 | Timeout (10s) | "Senden?"-Bildschirm | Nur SD, kein Upload |
-| 5s halten | Bereit | WiFi-Einstellungen zurücksetzen |
+| **OK** 5s halten | Bereit | WiFi-Einstellungen zurücksetzen |
 
 ### Piep-Signale
 
