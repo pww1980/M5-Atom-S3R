@@ -47,24 +47,40 @@ async def handle_connection(websocket):
     session_name = datetime.now().strftime("%Y_%m_%d_%H_%M")
     logger.info(f"[SESSION] Neue Verbindung: {session_name}")
 
-    pcm_data = bytearray()
-    clean_close = False
+    pcm_data    = bytearray()
+    done_frame  = False   # True = "DONE"-Textframe empfangen, Verbindung noch offen
+                          # False = Verbindung wurde per Close-Frame beendet (Fallback)
 
     try:
         async for message in websocket:
             if isinstance(message, bytes):
                 pcm_data.extend(message)
-            # Textframes ignorieren
-    except websockets.exceptions.ConnectionClosedOK:
-        clean_close = True
-    except websockets.exceptions.ConnectionClosedError:
-        clean_close = False
-    except Exception as e:
-        logger.error(f"[SESSION] Fehler: {e}")
-        clean_close = False
+            elif isinstance(message, str) and message.strip() == "DONE":
+                done_frame = True
+                break
+            # Andere Textframes ignorieren
 
-    if not clean_close or len(pcm_data) == 0:
-        logger.warning(f"[SESSION] {session_name} abgebrochen oder leer – verworfen")
+    except websockets.exceptions.ConnectionClosedOK:
+        # Gerät hat sauber per Close-Frame beendet (alte Firmware oder Abort-Pfad).
+        # Verbindung ist zu – kein ACK mehr möglich, aber Daten sind vollständig.
+        logger.info(f"[SESSION] {session_name} via Close-Frame beendet (kein ACK)")
+
+    except websockets.exceptions.ConnectionClosedError:
+        # Verbindung unerwartet getrennt → Puffer verwerfen
+        logger.warning(f"[SESSION] {session_name} unerwartet getrennt – verworfen")
+        return
+
+    except Exception as e:
+        logger.error(f"[SESSION] Unerwarteter Fehler: {e}")
+        return
+
+    if len(pcm_data) == 0:
+        logger.warning(f"[SESSION] {session_name} leer – verworfen")
+        if done_frame:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
         return
 
     # WAV schreiben
@@ -77,11 +93,13 @@ async def handle_connection(websocket):
 
     logger.info(f"[SESSION] WAV geschrieben: {wav_path} ({len(pcm_data)} Bytes PCM)")
 
-    # ACK zurück an Device
-    try:
-        await websocket.send("ACK")
-    except Exception:
-        pass
+    # ACK nur senden wenn Verbindung noch offen (DONE-Pfad)
+    if done_frame:
+        try:
+            await websocket.send("ACK")
+            await websocket.close()
+        except Exception as e:
+            logger.warning(f"[SESSION] ACK konnte nicht gesendet werden: {e}")
 
     # In Pipeline-Queue einreihen
     await pipeline_queue.put(wav_path)
