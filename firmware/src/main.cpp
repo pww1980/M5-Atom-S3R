@@ -312,8 +312,17 @@ void stopCapture() {
         Serial.println("[MIC] Warnung: audioTask wurde nicht rechtzeitig idle");
     }
 
-    while (M5.Mic.isRecording()) {
-        M5.delay(1);
+    // Zweite Absicherung: isRecording() sollte nach M5.Mic.end() (unten) false werden.
+    // Mit Timeout gegen einen Hardware-/DMA-Hänger absichern.
+    {
+        unsigned long tStart = millis();
+        while (M5.Mic.isRecording()) {
+            if (millis() - tStart > 500) {
+                Serial.println("[MIC] WARNUNG: isRecording() bleibt true – Hardware-Hänger?");
+                break;
+            }
+            M5.delay(1);
+        }
     }
 
     M5.Mic.end();
