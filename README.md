@@ -41,6 +41,8 @@ pio device monitor
 
 Die Firmware trägt sich selbst ins WLAN ein – keine Zugangsdaten im Code nötig (siehe Abschnitt **Ersteinrichtung** unter Bedienung).
 
+> **Technischer Hinweis:** Die Firmware nutzt beide Kerne des ESP32-S3. Der Audio-Capture läuft als dedizierter FreeRTOS-Task auf Core 0 und liest kontinuierlich vom I2S-DMA. Der WebSocket-Versand läuft auf Core 1 (Arduino-Loop). Kommunikation zwischen den Tasks erfolgt über eine FreeRTOS-Queue mit Buffer-Pool (16 × 1 KB im SRAM) – das verhindert Audioglitches auch bei kurzen WLAN-Verzögerungen.
+
 ---
 
 ### 2. Server-Backend (Python)
