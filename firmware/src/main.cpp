@@ -393,14 +393,18 @@ void finishRecording() {
 
     stopCapture();
 
+    // ACK-Flag VOR dem Senden von DONE zurücksetzen.
+    // Würde man es danach setzen, könnte ein sofort eintreffendes ACK
+    // in ws.loop() gesetzt und danach wieder gelöscht werden (Race Condition).
+    wsAckReceived = false;
+    processingStartMillis = millis();
+
     if (wsConnected) {
         ws.sendTXT("DONE");     // Server erwartet "DONE" → schreibt WAV, sendet ACK
         ws.loop();
     }
 
     beepPattern(1000, 80, 60, 3);
-    wsAckReceived = false;
-    processingStartMillis = millis();
     currentState = PROCESSING;
 }
 
