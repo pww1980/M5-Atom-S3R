@@ -277,6 +277,21 @@ bool serverReachable() {
 }
 
 // =============================================================================
+// HTTP-Hilfsfunktionen
+// =============================================================================
+void sendHello() {
+    char url[80];
+    snprintf(url, sizeof(url), "http://%s:%d/hello", serverIP, SERVER_PORT);
+
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("X-Device-IP", WiFi.localIP().toString().c_str());
+    http.setTimeout(3000);
+    http.GET();
+    http.end();
+}
+
+// =============================================================================
 // HTTP-Upload
 // =============================================================================
 bool uploadSegment(bool isFinal) {
@@ -422,6 +437,7 @@ void setup() {
 
     if (serverReachable()) {
         Serial.println("[BOOT] Server erreichbar");
+        sendHello();
         beepPattern(1000, 80, 80, 2);
     } else {
         Serial.println("[BOOT] Server NICHT erreichbar");
