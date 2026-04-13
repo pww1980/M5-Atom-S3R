@@ -155,7 +155,7 @@ void audioTask(void* /*param*/) {
         if (xQueueReceive(freeQueue, &buf, pdMS_TO_TICKS(50)) != pdTRUE)
             continue;
 
-        bool ok = M5.Mic.record(buf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, true);
+        bool ok = M5.Mic.record(buf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, false);
 
         if (xEventGroupGetBits(audioEvents) & EVT_STOP_REQUEST) {
             xQueueSend(freeQueue, &buf, 0);
