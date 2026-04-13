@@ -1,7 +1,22 @@
+/*
+ * main.cpp – Atom VoiceS3R Aufnahmegerät
+ *
+ * Ablauf:
+ *   1× Taste drücken → Aufnahme startet (1 Beep)
+ *   1× Taste drücken → Aufnahme stoppt → WAV als HTTP-POST an Server
+ *   3s lang drücken  → Aufnahme abbrechen
+ *   5s lang drücken  → WiFi-Reset (Config-Portal)
+ *
+ * Segmentierung:
+ *   Alle 30 Sekunden wird automatisch ein Segment hochgeladen.
+ *   Beim Stopp wird das letzte Segment mit X-Final: 1 markiert.
+ *   Der Server fügt alle Segmente zusammen und speichert ein WAV.
+ */
+
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <WiFiManager.h>
-#include <WebSocketsClient.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
@@ -9,25 +24,28 @@
 // =============================================================================
 // Konstanten
 // =============================================================================
-#define SERVER_PORT                 8765
+#define SERVER_PORT          8765
+#define HTTP_UPLOAD_PATH     "/upload"
 
-#define AUDIO_SAMPLE_RATE           16000
-#define AUDIO_BUF_SAMPLES           512
-#define AUDIO_BUF_BYTES             (AUDIO_BUF_SAMPLES * 2)
-#define AUDIO_POOL_SIZE             16
+#define AUDIO_SAMPLE_RATE    16000
+#define AUDIO_BUF_SAMPLES    512
+#define AUDIO_BUF_BYTES      (AUDIO_BUF_SAMPLES * 2)
+#define AUDIO_POOL_SIZE      64          // ~2s Puffer – reicht während HTTP-Upload
 
-#define LONG_PRESS_MS               3000
-#define PORTAL_RESET_HOLD_MS        5000
+#define LONG_PRESS_MS        3000
+#define PORTAL_RESET_HOLD_MS 5000
+#define AUDIO_STOP_WAIT_MS   300
 
-#define PSRAM_BUFFER_MAX_BYTES      (4 * 1024 * 1024)
-#define WIFI_RECONNECT_INTERVAL_MS  2000
-#define WIFI_RECONNECT_MAX_ATTEMPTS 30
-#define PROCESSING_TIMEOUT_MS       30000
-#define AUDIO_STOP_WAIT_MS          300
-#define WS_CONNECT_TIMEOUT_MS       3000
+// Segmentgröße: 30s × 16000 Hz × 2 Bytes = 960 000 Bytes
+#define SEGMENT_BYTES        (30 * AUDIO_SAMPLE_RATE * 2)
+// PSRAM-Puffer: Segment + 64 KB Headroom für filledQueue-Drain beim Stopp
+#define PSRAM_SEG_SIZE       (SEGMENT_BYTES + 64 * 1024)
+
+#define UPLOAD_RETRIES       3
+#define UPLOAD_RETRY_DELAY   600     // ms zwischen Retry-Versuchen
 
 // =============================================================================
-// EventGroup Bits
+// EventGroup-Bits
 // =============================================================================
 static EventGroupHandle_t audioEvents = nullptr;
 static constexpr EventBits_t EVT_AUDIO_IDLE    = (1 << 0);
@@ -37,14 +55,14 @@ static constexpr EventBits_t EVT_STOP_REQUEST  = (1 << 2);
 // =============================================================================
 // Zustandsmaschine
 // =============================================================================
-enum State { IDLE, RECORDING, RECONNECTING, PROCESSING };
+enum State { IDLE, RECORDING, UPLOADING };
 volatile State currentState = IDLE;
 
 char serverIP[40] = "192.168.x.x";
 Preferences prefs;
 
 // =============================================================================
-// Audio-Puffer + Queues
+// Audio-Pool + Queues
 // =============================================================================
 static int16_t audioPool[AUDIO_POOL_SIZE][AUDIO_BUF_SAMPLES];
 static QueueHandle_t freeQueue   = nullptr;
@@ -52,26 +70,17 @@ static QueueHandle_t filledQueue = nullptr;
 static volatile bool audioCapturing = false;
 
 // =============================================================================
-// PSRAM
+// PSRAM-Segment-Puffer (linearer Append-Puffer)
 // =============================================================================
-uint8_t* psramBuf  = nullptr;
-uint32_t psramHead = 0;
-uint32_t psramTail = 0;
-uint32_t psramUsed = 0;
+static uint8_t*  psramBuf = nullptr;
+static uint32_t  psramLen = 0;        // aktuell belegte Bytes
 
 // =============================================================================
-// WebSocket
+// Session / Upload
 // =============================================================================
-WebSocketsClient ws;
-volatile bool wsConnected   = false;
-volatile bool wsAckReceived = false;
-
-// =============================================================================
-// Reconnect / Processing
-// =============================================================================
-int reconnectAttempts = 0;
-unsigned long lastReconnectMillis = 0;
-unsigned long processingStartMillis = 0;
+static char sessionId[32] = "";
+static int  seqNum        = 0;
+static bool finalSegment  = false;
 
 // =============================================================================
 // WiFiManager
@@ -96,7 +105,6 @@ void beepPattern(uint16_t freqHz, uint32_t tonMs, uint32_t pauseMs, uint8_t coun
 void audioQueuesInit() {
     freeQueue   = xQueueCreate(AUDIO_POOL_SIZE, sizeof(int16_t*));
     filledQueue = xQueueCreate(AUDIO_POOL_SIZE, sizeof(int16_t*));
-
     for (int i = 0; i < AUDIO_POOL_SIZE; ++i) {
         int16_t* ptr = audioPool[i];
         xQueueSend(freeQueue, &ptr, 0);
@@ -105,134 +113,24 @@ void audioQueuesInit() {
 
 void drainFilledQueue() {
     int16_t* buf;
-    while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE) {
+    while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE)
         xQueueSend(freeQueue, &buf, 0);
-    }
 }
 
 // =============================================================================
-// PSRAM-Ringpuffer
+// PSRAM-Init
 // =============================================================================
 void psramBufInit() {
     if (!psramFound()) {
-        Serial.println("[PSRAM] Nicht verfügbar");
+        Serial.println("[PSRAM] Nicht verfügbar – max. ~64KB Aufnahme möglich");
         return;
     }
-    psramBuf = (uint8_t*)ps_malloc(PSRAM_BUFFER_MAX_BYTES);
+    psramBuf = (uint8_t*)ps_malloc(PSRAM_SEG_SIZE);
     if (psramBuf) {
-        Serial.printf("[PSRAM] %d MB reserviert\n", PSRAM_BUFFER_MAX_BYTES / (1024 * 1024));
+        Serial.printf("[PSRAM] %lu KB reserviert\n", (unsigned long)(PSRAM_SEG_SIZE / 1024));
     } else {
         Serial.println("[PSRAM] Allokierung fehlgeschlagen");
     }
-}
-
-void psramBufReset() {
-    psramHead = psramTail = psramUsed = 0;
-}
-
-void psramDropOldest(uint32_t len) {
-    uint32_t drop = (len > psramUsed) ? psramUsed : len;
-    psramTail = (psramTail + drop) % PSRAM_BUFFER_MAX_BYTES;
-    psramUsed -= drop;
-}
-
-void psramBufWrite(const uint8_t* data, uint32_t len) {
-    if (!psramBuf || len == 0) return;
-
-    while ((PSRAM_BUFFER_MAX_BYTES - psramUsed) < len) {
-        psramDropOldest(AUDIO_BUF_BYTES);
-        if (psramUsed == 0 && len > PSRAM_BUFFER_MAX_BYTES) {
-            data += (len - PSRAM_BUFFER_MAX_BYTES);
-            len = PSRAM_BUFFER_MAX_BYTES;
-            break;
-        }
-    }
-
-    uint32_t firstPart = min(len, PSRAM_BUFFER_MAX_BYTES - psramHead);
-    memcpy(&psramBuf[psramHead], data, firstPart);
-
-    uint32_t secondPart = len - firstPart;
-    if (secondPart > 0) {
-        memcpy(psramBuf, data + firstPart, secondPart);
-    }
-
-    psramHead = (psramHead + len) % PSRAM_BUFFER_MAX_BYTES;
-    psramUsed += len;
-}
-
-uint32_t psramBufRead(uint8_t* out, uint32_t maxLen) {
-    if (!psramBuf || psramUsed == 0 || maxLen == 0) return 0;
-
-    uint32_t toRead = min(psramUsed, maxLen);
-    uint32_t firstPart = min(toRead, PSRAM_BUFFER_MAX_BYTES - psramTail);
-
-    memcpy(out, &psramBuf[psramTail], firstPart);
-
-    uint32_t secondPart = toRead - firstPart;
-    if (secondPart > 0) {
-        memcpy(out + firstPart, psramBuf, secondPart);
-    }
-
-    psramTail = (psramTail + toRead) % PSRAM_BUFFER_MAX_BYTES;
-    psramUsed -= toRead;
-    return toRead;
-}
-
-// =============================================================================
-// WebSocket
-// =============================================================================
-void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
-    switch (type) {
-        case WStype_CONNECTED:
-            wsConnected = true;
-            Serial.println("[WS] Verbunden");
-            break;
-
-        case WStype_DISCONNECTED:
-            wsConnected = false;
-            Serial.println("[WS] Getrennt");
-            if (currentState == RECORDING) {
-                currentState = RECONNECTING;
-            } else if (currentState == PROCESSING && !wsAckReceived) {
-                // Verbindung verloren bevor ACK ankam – kein ACK mehr möglich.
-                // Sofort nach IDLE, nicht 30s auf Timeout warten.
-                Serial.println("[WS] Verbindung während PROCESSING verloren – IDLE");
-                currentState = IDLE;
-            }
-            break;
-
-        case WStype_TEXT:
-            if (length >= 3 && strncmp((char*)payload, "ACK", 3) == 0) {
-                wsAckReceived = true;
-                Serial.println("[WS] ACK empfangen");
-            }
-            break;
-
-        default:
-            break;
-    }
-}
-
-bool wsConnect() {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WS] WiFi nicht verbunden");
-        return false;
-    }
-
-    wsConnected = false;
-    ws.disconnect();                        // alten Zustand sauber bereinigen
-    ws.begin(serverIP, SERVER_PORT, "/");
-    ws.onEvent(wsEvent);
-    // 0 bedeutet in dieser Library-Version "sofort wiederholen" → Fehlermeldungs-Flut.
-    // 5000 ms begrenzt Wiederholversuche auf einen pro 5 Sekunden.
-    ws.setReconnectInterval(5000);
-
-    unsigned long start = millis();
-    while (!wsConnected && (millis() - start < WS_CONNECT_TIMEOUT_MS)) {
-        ws.loop();
-        delay(10);
-    }
-    return wsConnected;
 }
 
 // =============================================================================
@@ -254,9 +152,8 @@ void audioTask(void* /*param*/) {
         xEventGroupSetBits(audioEvents, EVT_AUDIO_RUNNING);
 
         int16_t* buf = nullptr;
-        if (xQueueReceive(freeQueue, &buf, pdMS_TO_TICKS(50)) != pdTRUE) {
+        if (xQueueReceive(freeQueue, &buf, pdMS_TO_TICKS(50)) != pdTRUE)
             continue;
-        }
 
         bool ok = M5.Mic.record(buf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, true);
 
@@ -268,7 +165,7 @@ void audioTask(void* /*param*/) {
 
         if (ok && audioCapturing) {
             if (xQueueSend(filledQueue, &buf, 0) != pdTRUE) {
-                Serial.println("[AUDIO] filledQueue voll – Chunk verworfen");
+                // filledQueue voll (passiert kurz während HTTP-Upload – akzeptabel)
                 xQueueSend(freeQueue, &buf, 0);
             }
         } else {
@@ -292,7 +189,6 @@ void startCapture() {
     M5.Speaker.end();
     M5.Mic.begin();
     audioCapturing = true;
-
     Serial.println("[MIC] Aufnahme gestartet");
 }
 
@@ -301,24 +197,18 @@ void stopCapture() {
     xEventGroupSetBits(audioEvents, EVT_STOP_REQUEST);
 
     EventBits_t bits = xEventGroupWaitBits(
-        audioEvents,
-        EVT_AUDIO_IDLE,
-        pdFALSE,
-        pdTRUE,
+        audioEvents, EVT_AUDIO_IDLE,
+        pdFALSE, pdTRUE,
         pdMS_TO_TICKS(AUDIO_STOP_WAIT_MS)
     );
+    if (!(bits & EVT_AUDIO_IDLE))
+        Serial.println("[MIC] Warnung: audioTask nicht rechtzeitig idle");
 
-    if (!(bits & EVT_AUDIO_IDLE)) {
-        Serial.println("[MIC] Warnung: audioTask wurde nicht rechtzeitig idle");
-    }
-
-    // Zweite Absicherung: isRecording() sollte nach M5.Mic.end() (unten) false werden.
-    // Mit Timeout gegen einen Hardware-/DMA-Hänger absichern.
     {
         unsigned long tStart = millis();
         while (M5.Mic.isRecording()) {
             if (millis() - tStart > 500) {
-                Serial.println("[MIC] WARNUNG: isRecording() bleibt true – Hardware-Hänger?");
+                Serial.println("[MIC] Warnung: isRecording() bleibt true");
                 break;
             }
             M5.delay(1);
@@ -328,16 +218,13 @@ void stopCapture() {
     M5.Mic.end();
     drainFilledQueue();
     M5.Speaker.begin();
-
     Serial.println("[MIC] Aufnahme gestoppt");
 }
 
 // =============================================================================
 // WiFi
 // =============================================================================
-void saveParamsCallback() {
-    shouldSaveParams = true;
-}
+void saveParamsCallback() { shouldSaveParams = true; }
 
 void setupWiFi(bool forcePortal = false) {
     shouldSaveParams = false;
@@ -349,7 +236,6 @@ void setupWiFi(bool forcePortal = false) {
 
     delete paramServerIP;
     paramServerIP = new WiFiManagerParameter("server_ip", "Server-IP (N100)", savedIP, 39);
-
     wm.addParameter(paramServerIP);
     wm.setSaveParamsCallback(saveParamsCallback);
     wm.setConfigPortalTimeout(180);
@@ -391,110 +277,118 @@ bool serverReachable() {
 }
 
 // =============================================================================
+// HTTP-Upload
+// =============================================================================
+bool uploadSegment(bool isFinal) {
+    if (!psramBuf || psramLen == 0) {
+        Serial.println("[HTTP] Puffer leer – nichts zu senden");
+        return true;
+    }
+
+    char url[80];
+    snprintf(url, sizeof(url), "http://%s:%d%s", serverIP, SERVER_PORT, HTTP_UPLOAD_PATH);
+
+    char seqStr[8];
+    snprintf(seqStr, sizeof(seqStr), "%d", seqNum);
+
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("Content-Type",  "application/octet-stream");
+    http.addHeader("X-Session-Id",  sessionId);
+    http.addHeader("X-Seq-Num",     seqStr);
+    http.addHeader("X-Final",       isFinal ? "1" : "0");
+    http.setTimeout(15000);
+
+    int code = http.POST(psramBuf, psramLen);
+    http.end();
+
+    if (code == 200) {
+        Serial.printf("[HTTP] Segment %d OK (%lu Bytes, final=%d)\n",
+                      seqNum, (unsigned long)psramLen, isFinal);
+        seqNum++;
+        psramLen = 0;
+        return true;
+    }
+
+    Serial.printf("[HTTP] Segment %d FEHLER: HTTP %d\n", seqNum, code);
+    return false;
+}
+
+// =============================================================================
 // Zustandsaktionen
 // =============================================================================
 void beginRecording() {
-    Serial.println("[BTN] Start Aufnahme");
+    Serial.println("[BTN] Aufnahme startet");
 
-    if (!wsConnect()) {
-        ws.disconnect();    // verhindert, dass ws.loop() im main loop weiter versucht
-        Serial.println("[BTN] WebSocket fehlgeschlagen");
-        beepPattern(600, 80, 80, 5);
-        return;
-    }
-
-    beepPattern(1000, 100, 0, 1);
-    psramBufReset();
-    wsAckReceived = false;
-    reconnectAttempts = 0;
-    lastReconnectMillis = 0;
+    snprintf(sessionId, sizeof(sessionId), "sess_%lu", (unsigned long)millis());
+    seqNum       = 0;
+    psramLen     = 0;
+    finalSegment = false;
 
     startCapture();
+    beepPattern(1000, 100, 0, 1);
     currentState = RECORDING;
+    Serial.printf("[BTN] Session: %s\n", sessionId);
 }
 
 void finishRecording() {
-    Serial.println("[BTN] Stopp Aufnahme");
-
+    Serial.println("[BTN] Aufnahme stoppt");
     stopCapture();
 
-    // ACK-Flag VOR dem Senden von DONE zurücksetzen.
-    // Würde man es danach setzen, könnte ein sofort eintreffendes ACK
-    // in ws.loop() gesetzt und danach wieder gelöscht werden (Race Condition).
-    wsAckReceived = false;
-    processingStartMillis = millis();
-
-    if (wsConnected) {
-        ws.sendTXT("DONE");     // Server erwartet "DONE" → schreibt WAV, sendet ACK
-        ws.loop();
-        beepPattern(1000, 80, 60, 3);
-        currentState = PROCESSING;
-    } else {
-        // Keine Verbindung → DONE kann nicht gesendet werden, ACK kommt nie.
-        // Direkt nach IDLE statt 30s auf Timeout zu warten.
-        Serial.println("[BTN] Kein WS – Aufnahme verworfen");
-        ws.disconnect();    // Library-Zustand sauber zurücksetzen
-        beepPattern(600, 80, 80, 3);
-        currentState = IDLE;
-    }
-}
-
-void abortRecording(const char* reason) {
-    Serial.printf("[BTN] Aufnahme abgebrochen (%s)\n", reason);
-    stopCapture();
-    ws.disconnect();
-    currentState = IDLE;
-}
-
-// =============================================================================
-// Reconnect
-// =============================================================================
-void handleReconnecting() {
+    // Verbleibende Chunks aus Queue noch in Puffer schreiben
     int16_t* buf;
     while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE) {
-        psramBufWrite((uint8_t*)buf, AUDIO_BUF_BYTES);
+        uint32_t space = PSRAM_SEG_SIZE - psramLen;
+        if (space >= AUDIO_BUF_BYTES && psramBuf) {
+            memcpy(psramBuf + psramLen, buf, AUDIO_BUF_BYTES);
+            psramLen += AUDIO_BUF_BYTES;
+        }
         xQueueSend(freeQueue, &buf, 0);
     }
 
-    unsigned long now = millis();
-    if (now - lastReconnectMillis < WIFI_RECONNECT_INTERVAL_MS) return;
-    lastReconnectMillis = now;
-
-    reconnectAttempts++;
-    Serial.printf("[RECONNECT] Versuch %d/%d\n", reconnectAttempts, WIFI_RECONNECT_MAX_ATTEMPTS);
-
-    if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
-
-    if (WiFi.status() == WL_CONNECTED && wsConnect()) {
-        uint8_t tmp[AUDIO_BUF_BYTES];
-        uint32_t n;
-
-        // wsConnected in der Schleifenbedingung prüfen:
-        // bricht die Verbindung während des PSRAM-Flushes ab, wird die Schleife
-        // sauber verlassen statt blind weiterzusenden.
-        while ((n = psramBufRead(tmp, AUDIO_BUF_BYTES)) > 0 && wsConnected) {
-            ws.sendBIN(tmp, n);
-            ws.loop();
-        }
-
-        if (wsConnected) {
-            reconnectAttempts = 0;
-            currentState = RECORDING;
-            Serial.println("[RECONNECT] Wiederverbunden");
-            return;
-        }
-        // Verbindung während Flush verloren → weiter zum Max-Attempts-Check unten.
-        Serial.println("[RECONNECT] Verbindung während PSRAM-Flush verloren");
-    }
-
-    if (reconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
-        Serial.println("[RECONNECT] Timeout – Aufnahme abgebrochen");
-        stopCapture();
-        ws.disconnect();
-        beepPattern(600, 80, 80, 5);
-        reconnectAttempts = 0;
+    if (psramLen == 0) {
+        Serial.println("[BTN] Puffer leer – nichts zu senden");
+        beepPattern(600, 80, 80, 2);
         currentState = IDLE;
+        return;
     }
+
+    finalSegment = true;
+    currentState = UPLOADING;
+}
+
+void abortRecording(const char* reason) {
+    Serial.printf("[BTN] Abbruch: %s\n", reason);
+    stopCapture();
+    psramLen = 0;
+    beepPattern(600, 80, 80, 3);
+    currentState = IDLE;
+}
+
+void handleUploading() {
+    bool ok = false;
+    for (int i = 0; i < UPLOAD_RETRIES; i++) {
+        ok = uploadSegment(finalSegment);
+        if (ok) break;
+        Serial.printf("[HTTP] Retry %d/%d\n", i + 1, UPLOAD_RETRIES);
+        delay(UPLOAD_RETRY_DELAY * (i + 1));
+    }
+
+    if (!ok) {
+        Serial.println("[HTTP] Upload endgültig fehlgeschlagen");
+        beepPattern(600, 80, 80, 5);
+        currentState = IDLE;
+        return;
+    }
+
+    if (finalSegment) {
+        beepPattern(1000, 80, 60, 3);   // 3 Beeps = Aufnahme abgeschlossen
+        Serial.println("[HTTP] Aufnahme abgeschlossen");
+        currentState = IDLE;
+    } else {
+        currentState = RECORDING;       // weiter aufnehmen
+    }
+    finalSegment = false;
 }
 
 // =============================================================================
@@ -512,9 +406,9 @@ void setup() {
     M5.Speaker.begin();
 
     audioEvents = xEventGroupCreate();
-    if (audioEvents == nullptr) {
-        Serial.println("[BOOT] EventGroup konnte nicht erstellt werden");
-        while (true) { delay(1000); }
+    if (!audioEvents) {
+        Serial.println("[BOOT] EventGroup fehlgeschlagen");
+        while (true) delay(1000);
     }
 
     psramBufInit();
@@ -523,7 +417,7 @@ void setup() {
     xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, nullptr, 5, nullptr, 0);
     Serial.println("[BOOT] audioTask gestartet (Core 0)");
 
-    WiFi.setSleep(false);   // Power-Save VOR setupWiFi() – verhindert kurzzeitigen Routenverlust
+    WiFi.setSleep(false);   // VOR setupWiFi – verhindert Routing-Reset
     setupWiFi();
 
     if (serverReachable()) {
@@ -543,12 +437,8 @@ void setup() {
 // =============================================================================
 void loop() {
     M5.update();
-    // ws.loop() im IDLE-Zustand NICHT aufrufen: die Library würde sonst nach
-    // dem konfigurierten reconnectInterval automatisch neue Verbindungen öffnen,
-    // obwohl keine Aufnahme läuft (leere Sessions auf dem Server).
-    if (currentState != IDLE) {
-        ws.loop();
-    }
+
+    // --- Button-Handling -------------------------------------------------------
 
     // Langer Druck im IDLE (≥5s) → WiFi-Reset
     if (currentState == IDLE && M5.BtnA.wasReleaseFor(PORTAL_RESET_HOLD_MS)) {
@@ -559,48 +449,45 @@ void loop() {
         ESP.restart();
     }
 
-    // Langer Druck im RECORDING/RECONNECTING (≥3s) → Aufnahme abbrechen
-    if ((currentState == RECORDING || currentState == RECONNECTING) &&
-        M5.BtnA.wasReleaseFor(LONG_PRESS_MS)) {
+    // Langer Druck im RECORDING (≥3s) → Aufnahme abbrechen
+    if (currentState == RECORDING && M5.BtnA.wasReleaseFor(LONG_PRESS_MS)) {
         abortRecording("Langdruck");
         return;
     }
 
-    // Kurzer Druck
+    // Kurzer Druck: Toggle Start/Stop
     if (M5.BtnA.wasReleased()) {
         if (currentState == IDLE) {
             beginRecording();
-        } else if (currentState == RECORDING || currentState == RECONNECTING) {
+        } else if (currentState == RECORDING) {
             finishRecording();
         }
+        // Im UPLOADING-Zustand Tastendruck ignorieren
     }
 
-    // Audio streamen (RECORDING)
-    if (currentState == RECORDING && wsConnected) {
+    // --- Audio in PSRAM schreiben (RECORDING) ----------------------------------
+    if (currentState == RECORDING && psramBuf) {
         int16_t* buf;
         while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE) {
-            ws.sendBIN((uint8_t*)buf, AUDIO_BUF_BYTES);
+            if (psramLen + AUDIO_BUF_BYTES <= PSRAM_SEG_SIZE) {
+                memcpy(psramBuf + psramLen, buf, AUDIO_BUF_BYTES);
+                psramLen += AUDIO_BUF_BYTES;
+            }
             xQueueSend(freeQueue, &buf, 0);
         }
-    }
 
-    // PSRAM puffern + Reconnect (RECONNECTING)
-    if (currentState == RECONNECTING) {
-        handleReconnecting();
-    }
-
-    // Warten auf ACK (PROCESSING)
-    if (currentState == PROCESSING) {
-        if (wsAckReceived) {
-            Serial.println("[PIPELINE] Server hat Job übernommen");
-            ws.disconnect();
-            currentState = IDLE;
-        } else if (millis() - processingStartMillis > PROCESSING_TIMEOUT_MS) {
-            Serial.println("[PIPELINE] Timeout – kein ACK vom Server");
-            ws.disconnect();
-            beepPattern(600, 80, 80, 3);
-            currentState = IDLE;
+        // Segmentgrenze erreicht → automatisch hochladen
+        if (psramLen >= SEGMENT_BYTES) {
+            Serial.printf("[REC] Segment voll (%lu KB) – Upload\n",
+                          (unsigned long)(psramLen / 1024));
+            finalSegment = false;
+            currentState = UPLOADING;
         }
+    }
+
+    // --- Segment hochladen (UPLOADING) -----------------------------------------
+    if (currentState == UPLOADING) {
+        handleUploading();
     }
 
     delay(2);

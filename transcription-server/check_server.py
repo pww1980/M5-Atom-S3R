@@ -9,17 +9,14 @@ Verwendung:
 """
 
 import argparse
-import asyncio
 import os
 import shutil
 import socket
-import struct
 import subprocess
 import sys
 import time
 
 import requests
-import websockets
 
 import config
 
@@ -32,9 +29,9 @@ YELLOW = "\033[93m"
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 
-def ok(msg):    print(f"  {GREEN}✓{RESET}  {msg}")
-def fail(msg):  print(f"  {RED}✗{RESET}  {msg}")
-def warn(msg):  print(f"  {YELLOW}!{RESET}  {msg}")
+def ok(msg):     print(f"  {GREEN}✓{RESET}  {msg}")
+def fail(msg):   print(f"  {RED}✗{RESET}  {msg}")
+def warn(msg):   print(f"  {YELLOW}!{RESET}  {msg}")
 def header(msg): print(f"\n{BOLD}{msg}{RESET}")
 
 # =============================================================================
@@ -53,7 +50,7 @@ def check(name: str, passed: bool, detail: str = ""):
 
 # --- 1. TCP-Erreichbarkeit ---------------------------------------------------
 def check_tcp(host: str, port: int) -> bool:
-    header("1  WebSocket-Server")
+    header("1  HTTP-Server")
     try:
         s = socket.create_connection((host, port), timeout=3)
         s.close()
@@ -62,43 +59,33 @@ def check_tcp(host: str, port: int) -> bool:
         return check("TCP-Verbindung", False, str(e))
 
 
-# --- 2. WebSocket-Handshake + ACK -------------------------------------------
-async def _ws_roundtrip(host: str, port: int) -> tuple[bool, bool]:
-    """Verbindet per WebSocket, sendet PCM-Stille + DONE-Frame, erwartet ACK.
-
-    Das Gerät sendet DONE (kein WebSocket-Close-Frame) – erst danach schickt
-    der Server ACK und schließt die Verbindung.  Der Close-Frame-Pfad sendet
-    bewusst kein ACK (Verbindung ist bereits halb geschlossen).
-    """
-    uri = f"ws://{host}:{port}"
-    hs_ok  = False
-    ack_ok = False
+# --- 2. HTTP-Upload-Endpunkt -------------------------------------------------
+def check_http_upload(host: str, port: int) -> bool:
+    # 1 Sekunde Stille (16kHz, 16bit, mono = 32 KB)
+    silence = b"\x00" * (config.AUDIO_SAMPLE_RATE * config.AUDIO_BIT_DEPTH // 8)
     try:
-        async with websockets.connect(uri, open_timeout=5) as ws:
-            hs_ok = True
-            # 512 Samples × 2 Bytes Stille = 1 KB (entspricht einem echten Chunk)
-            silence = b"\x00" * 1024
-            await ws.send(silence)
-            # DONE senden → Server schreibt WAV, sendet ACK, schließt dann selbst
-            await ws.send("DONE")
-            # ACK mit kurzem Timeout abwarten
-            try:
-                async with asyncio.timeout(8):
-                    async for msg in ws:
-                        if isinstance(msg, str) and msg.startswith("ACK"):
-                            ack_ok = True
-                            break
-            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-                pass
+        r = requests.post(
+            f"http://{host}:{port}/upload",
+            headers={
+                "Content-Type":  "application/octet-stream",
+                "X-Session-Id":  "healthcheck",
+                "X-Seq-Num":     "0",
+                "X-Final":       "1",
+            },
+            data=silence,
+            timeout=10,
+        )
+        ack_ok = r.status_code == 200 and r.text.strip() == "ACK"
+        check(
+            "HTTP POST /upload + ACK",
+            ack_ok,
+            "ACK empfangen" if ack_ok else f"HTTP {r.status_code}: {r.text[:40]}",
+        )
+        return ack_ok
+    except requests.exceptions.ConnectionError:
+        return check("HTTP POST /upload + ACK", False, "Verbindung abgelehnt")
     except Exception as e:
-        return hs_ok, ack_ok
-    return hs_ok, ack_ok
-
-def check_websocket(host: str, port: int) -> bool:
-    hs_ok, ack_ok = asyncio.run(_ws_roundtrip(host, port))
-    check("WebSocket-Handshake",   hs_ok,  "Verbindung aufgebaut"  if hs_ok  else "Handshake fehlgeschlagen")
-    check("Server-ACK nach DONE",  ack_ok, "ACK empfangen"         if ack_ok else "kein ACK innerhalb 8 s")
-    return hs_ok and ack_ok
+        return check("HTTP POST /upload + ACK", False, str(e))
 
 
 # --- 3. Ollama ---------------------------------------------------------------
@@ -108,13 +95,12 @@ def check_ollama() -> bool:
     try:
         r = requests.get(base, timeout=5)
         running = check("Ollama läuft", r.status_code == 200, f"HTTP {r.status_code}")
-    except requests.exceptions.ConnectionError as e:
+    except requests.exceptions.ConnectionError:
         return check("Ollama läuft", False, "nicht erreichbar – läuft Ollama?")
 
     if not running:
         return False
 
-    # Modell vorhanden?
     try:
         r = requests.get(f"{base}/api/tags", timeout=5)
         models = [m["name"] for m in r.json().get("models", [])]
@@ -193,7 +179,6 @@ def check_packages() -> bool:
     packages = {
         "faster_whisper": "faster-whisper",
         "pyannote.audio": "pyannote.audio",
-        "websockets":     "websockets",
         "pydub":          "pydub",
         "requests":       "requests",
         "torch":          "torch",
@@ -233,12 +218,12 @@ def print_summary():
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(description="Atom Transcription Server – Health Check")
-    parser.add_argument("--host", default=config.WEBSOCKET_HOST.replace("0.0.0.0", "127.0.0.1"),
-                        help="WebSocket-Host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=config.WEBSOCKET_PORT,
-                        help=f"WebSocket-Port (default: {config.WEBSOCKET_PORT})")
-    parser.add_argument("--skip-ws", action="store_true",
-                        help="WebSocket-Test überspringen (wenn Server nicht läuft)")
+    parser.add_argument("--host", default=config.SERVER_HOST.replace("0.0.0.0", "127.0.0.1"),
+                        help="Server-Host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=config.SERVER_PORT,
+                        help=f"Server-Port (default: {config.SERVER_PORT})")
+    parser.add_argument("--skip-http", action="store_true",
+                        help="HTTP-Test überspringen (wenn Server nicht läuft)")
     args = parser.parse_args()
 
     print(f"{BOLD}=== Atom Transcription Server – Health Check ==={RESET}")
@@ -250,17 +235,16 @@ def main():
     check_ffmpeg()
     check_ollama()
 
-    if not args.skip_ws:
+    if not args.skip_http:
         tcp_ok = check_tcp(args.host, args.port)
         if tcp_ok:
-            check_websocket(args.host, args.port)
+            check_http_upload(args.host, args.port)
         else:
-            warn("WebSocket-Test übersprungen (TCP nicht erreichbar)")
+            warn("HTTP-Test übersprungen (TCP nicht erreichbar)")
             warn("Server starten mit: python main.py")
-            results.append(("WebSocket-Handshake",   False))
-            results.append(("Server-ACK nach Close",  False))
+            results.append(("HTTP POST /upload + ACK", False))
     else:
-        warn("WebSocket-Test übersprungen (--skip-ws)")
+        warn("HTTP-Test übersprungen (--skip-http)")
 
     success = print_summary()
     sys.exit(0 if success else 1)
