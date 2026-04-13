@@ -35,6 +35,7 @@
 #define LONG_PRESS_MS        3000
 #define PORTAL_RESET_HOLD_MS 5000
 #define AUDIO_STOP_WAIT_MS   300
+#define BUTTON_PIN           41      // GPIO des Tasters (active-low, Pull-up)
 
 // Segmentgröße: 30s × 16000 Hz × 2 Bytes = 960 000 Bytes
 #define SEGMENT_BYTES        (30 * AUDIO_SAMPLE_RATE * 2)
@@ -443,6 +444,9 @@ void setup() {
     psramBufInit();
     audioQueuesInit();
 
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+    Serial.printf("[BOOT] Button GPIO %d konfiguriert\n", BUTTON_PIN);
+
     xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, nullptr, 5, nullptr, 0);
     Serial.println("[BOOT] audioTask gestartet (Core 0)");
 
@@ -475,36 +479,61 @@ void setup() {
 }
 
 // =============================================================================
+// Button – direktes GPIO-Reading (umgeht M5Unified-Board-Detection)
+// =============================================================================
+static bool     _btnPrev      = HIGH;
+static uint32_t _btnPressedAt = 0;
+static bool     _btnEvent     = false;
+static uint32_t _btnHeldMs    = 0;
+
+void updateButton() {
+    bool raw = digitalRead(BUTTON_PIN);   // LOW = gedrückt
+    _btnEvent = false;
+
+    if (raw == _btnPrev) return;
+
+    uint32_t now = millis();
+
+    if (_btnPrev == HIGH && raw == LOW) {
+        // Flanke: losgelassen → gedrückt
+        _btnPressedAt = now;
+    } else if (_btnPrev == LOW && raw == HIGH) {
+        // Flanke: gedrückt → losgelassen → Event auslösen
+        _btnHeldMs = now - _btnPressedAt;
+        _btnEvent  = true;
+        Serial.printf("[BTN] Release nach %lums\n", (unsigned long)_btnHeldMs);
+    }
+    _btnPrev = raw;
+}
+
+// =============================================================================
 // Loop (Core 1)
 // =============================================================================
 void loop() {
     M5.update();
+    updateButton();
 
     // --- Button-Handling -------------------------------------------------------
+    if (_btnEvent) {
+        if (_btnHeldMs >= PORTAL_RESET_HOLD_MS && currentState == IDLE) {
+            Serial.println("[BTN] WiFi-Reset");
+            beepPattern(1000, 200, 100, 2);
+            wm.resetSettings();
+            delay(500);
+            ESP.restart();
 
-    // Langer Druck im IDLE (≥5s) → WiFi-Reset
-    if (currentState == IDLE && M5.BtnA.wasReleaseFor(PORTAL_RESET_HOLD_MS)) {
-        Serial.println("[BTN] WiFi-Reset");
-        beepPattern(1000, 200, 100, 2);
-        wm.resetSettings();
-        delay(500);
-        ESP.restart();
-    }
+        } else if (_btnHeldMs >= LONG_PRESS_MS && currentState == RECORDING) {
+            abortRecording("Langdruck");
 
-    // Langer Druck im RECORDING (≥3s) → Aufnahme abbrechen
-    if (currentState == RECORDING && M5.BtnA.wasReleaseFor(LONG_PRESS_MS)) {
-        abortRecording("Langdruck");
-        return;
-    }
-
-    // Kurzer Druck: Toggle Start/Stop
-    if (M5.BtnA.wasReleased()) {
-        if (currentState == IDLE) {
-            beginRecording();
-        } else if (currentState == RECORDING) {
-            finishRecording();
+        } else {
+            // Kurzer Druck: Toggle Start/Stop
+            if (currentState == IDLE) {
+                beginRecording();
+            } else if (currentState == RECORDING) {
+                finishRecording();
+            }
+            // Im UPLOADING-Zustand Tastendruck ignorieren
         }
-        // Im UPLOADING-Zustand Tastendruck ignorieren
     }
 
     // --- Audio in PSRAM schreiben (RECORDING) ----------------------------------
