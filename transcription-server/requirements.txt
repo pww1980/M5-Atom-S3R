@@ -1,0 +1,7 @@
+faster-whisper
+pyannote.audio
+websockets
+pydub
+requests
+torch
+torchaudio
