@@ -1,5 +1,11 @@
 """
 audio_receiver.py – WebSocket-Server, empfängt PCM-Audio, schreibt WAV.
+
+Ende-Erkennung (in Priorität):
+  1. "DONE"-Textframe vom Gerät  → ACK senden, Verbindung schließen
+  2. Sauberer Close-Frame        → kein ACK möglich, Daten verarbeiten
+  3. Idle-Timeout (5s kein Chunk) → Verbindung schließen, Daten verarbeiten
+  4. Unerwarteter Abbruch        → Puffer verwerfen
 """
 
 import asyncio
@@ -16,6 +22,8 @@ import config
 logger = logging.getLogger(__name__)
 
 pipeline_queue: asyncio.Queue = None  # wird von main.py gesetzt
+
+IDLE_TIMEOUT = 5.0   # Sekunden ohne Daten → Aufnahme gilt als beendet
 
 
 def _build_wav_header(pcm_len: int) -> bytes:
@@ -48,62 +56,93 @@ async def handle_connection(websocket):
     session_name = datetime.now().strftime("%Y_%m_%d_%H_%M")
     logger.info(f"[SESSION] Neue Verbindung: {session_name}")
 
-    pcm_data    = bytearray()
-    done_frame  = False   # True = "DONE"-Textframe empfangen, Verbindung noch offen
-                          # False = Verbindung wurde per Close-Frame beendet (Fallback)
+    pcm_data   = bytearray()
+    done_frame = False    # True = "DONE"-Frame, Verbindung noch offen → ACK möglich
+    end_reason = "?"
 
+    # -----------------------------------------------------------------------
+    # Empfangsschleife mit Idle-Timeout
+    # asyncio.wait_for() auf jeden einzelnen recv()-Aufruf:
+    # → wenn 5s kein Chunk kommt, gilt Aufnahme als beendet
+    # → robuster als "DONE"-Frame alleine (Timing-Probleme auf ESP32-Seite)
+    # -----------------------------------------------------------------------
     try:
-        async for message in websocket:
+        while True:
+            try:
+                message = await asyncio.wait_for(
+                    websocket.recv(), timeout=IDLE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                end_reason = f"Idle-Timeout ({IDLE_TIMEOUT:.0f}s)"
+                logger.info(f"[SESSION] {session_name}: {end_reason} – Aufnahme beendet")
+                break
+
             if isinstance(message, bytes):
                 pcm_data.extend(message)
+
             elif isinstance(message, str) and message.strip() == "DONE":
                 done_frame = True
+                end_reason = "DONE-Frame"
+                logger.info(f"[SESSION] {session_name}: DONE empfangen")
                 break
+
             # Andere Textframes ignorieren
 
     except websockets.exceptions.ConnectionClosedOK:
-        # Gerät hat sauber per Close-Frame beendet (alte Firmware oder Abort-Pfad).
-        # Verbindung ist zu – kein ACK mehr möglich, aber Daten sind vollständig.
-        logger.info(f"[SESSION] {session_name} via Close-Frame beendet (kein ACK)")
+        end_reason = "Close-Frame"
+        logger.info(f"[SESSION] {session_name}: sauberer Close-Frame (kein ACK möglich)")
 
     except websockets.exceptions.ConnectionClosedError:
-        # Verbindung unerwartet getrennt → Puffer verwerfen
-        logger.warning(f"[SESSION] {session_name} unerwartet getrennt – verworfen")
+        logger.warning(f"[SESSION] {session_name}: unerwarteter Abbruch – verworfen")
         return
 
     except Exception as e:
-        logger.error(f"[SESSION] Unerwarteter Fehler: {e}")
+        logger.error(f"[SESSION] {session_name}: Fehler: {e}")
         return
 
+    # -----------------------------------------------------------------------
+    # Leere Session verwerfen
+    # -----------------------------------------------------------------------
     if len(pcm_data) == 0:
-        logger.warning(f"[SESSION] {session_name} leer – verworfen")
-        if done_frame:
-            try:
-                await websocket.close()
-            except Exception:
-                pass
+        logger.warning(f"[SESSION] {session_name}: kein Audio empfangen – verworfen")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
         return
 
-    # WAV als temporäre Datei schreiben – output/ bleibt für Endergebnisse reserviert
+    # -----------------------------------------------------------------------
+    # WAV in /tmp/ schreiben
+    # -----------------------------------------------------------------------
     wav_path = os.path.join(tempfile.gettempdir(), f"atom_{session_name}.wav")
 
     with open(wav_path, 'wb') as f:
         f.write(_build_wav_header(len(pcm_data)))
         f.write(pcm_data)
 
-    logger.info(f"[SESSION] WAV geschrieben: {wav_path} ({len(pcm_data)} Bytes PCM)")
+    duration_s = len(pcm_data) / (config.AUDIO_SAMPLE_RATE
+                                   * config.AUDIO_CHANNELS
+                                   * config.AUDIO_BIT_DEPTH // 8)
+    logger.info(
+        f"[SESSION] {session_name}: WAV → {wav_path} "
+        f"({len(pcm_data)} Bytes, {duration_s:.1f}s, Ende: {end_reason})"
+    )
 
-    # ACK nur senden wenn Verbindung noch offen (DONE-Pfad)
-    if done_frame:
+    # -----------------------------------------------------------------------
+    # ACK – nur wenn Verbindung noch offen (DONE-Pfad oder nach Idle-Timeout)
+    # -----------------------------------------------------------------------
+    if done_frame or end_reason.startswith("Idle"):
         try:
             await websocket.send("ACK")
             await websocket.close()
         except Exception as e:
-            logger.warning(f"[SESSION] ACK konnte nicht gesendet werden: {e}")
+            logger.debug(f"[SESSION] ACK nicht gesendet: {e}")
 
+    # -----------------------------------------------------------------------
     # In Pipeline-Queue einreihen
+    # -----------------------------------------------------------------------
     await pipeline_queue.put(wav_path)
-    logger.info(f"[SESSION] In Queue eingereiht: {wav_path}")
+    logger.info(f"[SESSION] {session_name}: in Queue eingereiht")
 
 
 async def start_server():
