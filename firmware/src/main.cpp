@@ -7,8 +7,9 @@
  *   3s lang drücken  → Aufnahme abbrechen
  *   5s lang drücken  → WiFi-Reset (Config-Portal)
  *
- * Segmentierung:
+ * Segmentierung (Double-Buffer / Ping-Pong):
  *   Alle 30 Sekunden wird automatisch ein Segment hochgeladen.
+ *   Der uploadTask läuft parallel zur Aufnahme – kein Audio-Gap.
  *   Beim Stopp wird das letzte Segment mit X-Final: 1 markiert.
  *   Der Server fügt alle Segmente zusammen und speichert ein WAV.
  */
@@ -30,20 +31,20 @@
 #define AUDIO_SAMPLE_RATE    16000
 #define AUDIO_BUF_SAMPLES    512
 #define AUDIO_BUF_BYTES      (AUDIO_BUF_SAMPLES * 2)
-#define AUDIO_POOL_SIZE      64          // ~2s Puffer – reicht während HTTP-Upload
+#define AUDIO_POOL_SIZE      64          // ~2s Puffer während HTTP-Upload
 
 #define LONG_PRESS_MS        3000
 #define PORTAL_RESET_HOLD_MS 5000
 #define AUDIO_STOP_WAIT_MS   300
-#define BUTTON_PIN           41      // GPIO des Tasters (active-low, Pull-up)
+#define BUTTON_PIN           41          // GPIO des Tasters (active-low)
 
 // Segmentgröße: 30s × 16000 Hz × 2 Bytes = 960 000 Bytes
 #define SEGMENT_BYTES        (30 * AUDIO_SAMPLE_RATE * 2)
-// PSRAM-Puffer: Segment + 64 KB Headroom für filledQueue-Drain beim Stopp
+// PSRAM-Puffer: Segment + 64 KB Headroom
 #define PSRAM_SEG_SIZE       (SEGMENT_BYTES + 64 * 1024)
 
 #define UPLOAD_RETRIES       3
-#define UPLOAD_RETRY_DELAY   600     // ms zwischen Retry-Versuchen
+#define UPLOAD_RETRY_DELAY   600         // ms zwischen Retry-Versuchen
 
 // =============================================================================
 // EventGroup-Bits
@@ -71,25 +72,30 @@ static QueueHandle_t filledQueue = nullptr;
 static volatile bool audioCapturing = false;
 
 // =============================================================================
-// PSRAM-Segment-Puffer (linearer Append-Puffer)
+// Double-Buffer (PSRAM Ping-Pong)
 // =============================================================================
-static uint8_t*  psramBuf = nullptr;
-static uint32_t  psramLen = 0;        // aktuell belegte Bytes
+static uint8_t*     psramBuf[2] = {nullptr, nullptr};
+static uint32_t     psramLen[2] = {0, 0};
+static volatile int recBufIdx   = 0;     // Buffer der gerade beschrieben wird
 
 // =============================================================================
 // Session / Upload
 // =============================================================================
 static char sessionId[32] = "";
+static int  seqNum        = 0;
+
+struct UploadJob { int bufIdx; int seq; bool isFinal; };
+static QueueHandle_t     uploadJobQueue = nullptr;
+static SemaphoreHandle_t uploadDoneSem  = nullptr;
+static volatile bool     uploadFinalOk  = false;
 
 // =============================================================================
 // Button-Zustand (muss vor setup() deklariert sein)
 // =============================================================================
-static bool     _btnPrev      = HIGH;  // wird in setup() mit echtem GPIO-Zustand überschrieben
+static bool     _btnPrev      = HIGH;
 static uint32_t _btnPressedAt = 0;
 static bool     _btnEvent     = false;
 static uint32_t _btnHeldMs    = 0;
-static int  seqNum        = 0;
-static bool finalSegment  = false;
 
 // =============================================================================
 // WiFiManager
@@ -127,18 +133,21 @@ void drainFilledQueue() {
 }
 
 // =============================================================================
-// PSRAM-Init
+// PSRAM-Init (zwei Puffer)
 // =============================================================================
 void psramBufInit() {
     if (!psramFound()) {
         Serial.println("[PSRAM] Nicht verfügbar – max. ~64KB Aufnahme möglich");
         return;
     }
-    psramBuf = (uint8_t*)ps_malloc(PSRAM_SEG_SIZE);
-    if (psramBuf) {
-        Serial.printf("[PSRAM] %lu KB reserviert\n", (unsigned long)(PSRAM_SEG_SIZE / 1024));
-    } else {
-        Serial.println("[PSRAM] Allokierung fehlgeschlagen");
+    for (int i = 0; i < 2; i++) {
+        psramBuf[i] = (uint8_t*)ps_malloc(PSRAM_SEG_SIZE);
+        if (psramBuf[i]) {
+            Serial.printf("[PSRAM] Puffer %d: %lu KB reserviert\n",
+                          i, (unsigned long)(PSRAM_SEG_SIZE / 1024));
+        } else {
+            Serial.printf("[PSRAM] Puffer %d: Allokierung fehlgeschlagen\n", i);
+        }
     }
 }
 
@@ -173,10 +182,8 @@ void audioTask(void* /*param*/) {
         }
 
         if (ok && audioCapturing) {
-            if (xQueueSend(filledQueue, &buf, 0) != pdTRUE) {
-                // filledQueue voll (passiert kurz während HTTP-Upload – akzeptabel)
-                xQueueSend(freeQueue, &buf, 0);
-            }
+            if (xQueueSend(filledQueue, &buf, 0) != pdTRUE)
+                xQueueSend(freeQueue, &buf, 0);  // Queue voll: Frame verwerfen
         } else {
             xQueueSend(freeQueue, &buf, 0);
         }
@@ -326,9 +333,10 @@ void sendStatus(const char* event) {
 // =============================================================================
 // HTTP-Upload
 // =============================================================================
-bool uploadSegment(bool isFinal) {
-    if (!psramBuf || psramLen == 0) {
-        Serial.println("[HTTP] Puffer leer – nichts zu senden");
+bool uploadSegment(int bufIdx, int seq, bool isFinal) {
+    // Leeres nicht-finales Segment überspringen
+    if (!psramBuf[bufIdx] || (!isFinal && psramLen[bufIdx] == 0)) {
+        Serial.printf("[HTTP] Seg %d übersprungen (leer)\n", seq);
         return true;
     }
 
@@ -336,7 +344,7 @@ bool uploadSegment(bool isFinal) {
     snprintf(url, sizeof(url), "http://%s:%d%s", serverIP, SERVER_PORT, HTTP_UPLOAD_PATH);
 
     char seqStr[8];
-    snprintf(seqStr, sizeof(seqStr), "%d", seqNum);
+    snprintf(seqStr, sizeof(seqStr), "%d", seq);
 
     HTTPClient http;
     http.begin(url);
@@ -346,19 +354,45 @@ bool uploadSegment(bool isFinal) {
     http.addHeader("X-Final",       isFinal ? "1" : "0");
     http.setTimeout(15000);
 
-    int code = http.POST(psramBuf, psramLen);
+    int code = http.POST(psramBuf[bufIdx], psramLen[bufIdx]);
     http.end();
 
     if (code == 200) {
-        Serial.printf("[HTTP] Segment %d OK (%lu Bytes, final=%d)\n",
-                      seqNum, (unsigned long)psramLen, isFinal);
-        seqNum++;
-        psramLen = 0;
+        Serial.printf("[HTTP] Seg %d OK (%lu Bytes, final=%d)\n",
+                      seq, (unsigned long)psramLen[bufIdx], isFinal);
         return true;
     }
 
-    Serial.printf("[HTTP] Segment %d FEHLER: HTTP %d\n", seqNum, code);
+    Serial.printf("[HTTP] Seg %d FEHLER: HTTP %d\n", seq, code);
     return false;
+}
+
+// =============================================================================
+// Upload-Task (Core 1) – läuft parallel zur Aufnahme
+// =============================================================================
+void uploadTask(void* /*param*/) {
+    for (;;) {
+        UploadJob job;
+        xQueueReceive(uploadJobQueue, &job, portMAX_DELAY);
+
+        bool ok = false;
+        for (int i = 0; i < UPLOAD_RETRIES; i++) {
+            ok = uploadSegment(job.bufIdx, job.seq, job.isFinal);
+            if (ok) break;
+            Serial.printf("[HTTP] Retry %d/%d (Seg %d)\n", i + 1, UPLOAD_RETRIES, job.seq);
+            vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_DELAY * (i + 1)));
+        }
+
+        if (!ok)
+            Serial.printf("[HTTP] Seg %d endgültig fehlgeschlagen\n", job.seq);
+
+        psramLen[job.bufIdx] = 0;   // Puffer freigeben
+
+        if (job.isFinal) {
+            uploadFinalOk = ok;
+            xSemaphoreGive(uploadDoneSem);
+        }
+    }
 }
 
 // =============================================================================
@@ -366,12 +400,12 @@ bool uploadSegment(bool isFinal) {
 // =============================================================================
 void beginRecording() {
     Serial.println("[BTN] Aufnahme startet");
-
     snprintf(sessionId, sizeof(sessionId), "sess_%lu", (unsigned long)millis());
     sendStatus("recording_start");
-    seqNum       = 0;
-    psramLen     = 0;
-    finalSegment = false;
+    seqNum      = 0;
+    recBufIdx   = 0;
+    psramLen[0] = 0;
+    psramLen[1] = 0;
 
     startCapture();
     beepPattern(1000, 100, 0, 1);
@@ -384,60 +418,33 @@ void finishRecording() {
     sendStatus("recording_stop");
     stopCapture();
 
-    // Verbleibende Chunks aus Queue noch in Puffer schreiben
+    // Verbleibende Chunks aus Queue in aktuellen Puffer schreiben
     int16_t* buf;
     while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE) {
-        uint32_t space = PSRAM_SEG_SIZE - psramLen;
-        if (space >= AUDIO_BUF_BYTES && psramBuf) {
-            memcpy(psramBuf + psramLen, buf, AUDIO_BUF_BYTES);
-            psramLen += AUDIO_BUF_BYTES;
+        uint32_t space = PSRAM_SEG_SIZE - psramLen[recBufIdx];
+        if (space >= AUDIO_BUF_BYTES && psramBuf[recBufIdx]) {
+            memcpy(psramBuf[recBufIdx] + psramLen[recBufIdx], buf, AUDIO_BUF_BYTES);
+            psramLen[recBufIdx] += AUDIO_BUF_BYTES;
         }
         xQueueSend(freeQueue, &buf, 0);
     }
 
-    if (psramLen == 0) {
-        Serial.println("[BTN] Puffer leer – nichts zu senden");
-        beepPattern(600, 80, 80, 2);
-        currentState = IDLE;
-        return;
-    }
-
-    finalSegment = true;
+    // Finales Segment einreihen (leeres Segment signalisiert Session-Ende)
+    UploadJob job = { recBufIdx, seqNum++, true };
+    xQueueSend(uploadJobQueue, &job, portMAX_DELAY);
     currentState = UPLOADING;
 }
 
 void abortRecording(const char* reason) {
     Serial.printf("[BTN] Abbruch: %s\n", reason);
     stopCapture();
-    psramLen = 0;
+    // Ausstehende Upload-Jobs verwerfen
+    UploadJob dummy;
+    while (xQueueReceive(uploadJobQueue, &dummy, 0) == pdTRUE) {}
+    psramLen[0] = 0;
+    psramLen[1] = 0;
     beepPattern(600, 80, 80, 3);
     currentState = IDLE;
-}
-
-void handleUploading() {
-    bool ok = false;
-    for (int i = 0; i < UPLOAD_RETRIES; i++) {
-        ok = uploadSegment(finalSegment);
-        if (ok) break;
-        Serial.printf("[HTTP] Retry %d/%d\n", i + 1, UPLOAD_RETRIES);
-        delay(UPLOAD_RETRY_DELAY * (i + 1));
-    }
-
-    if (!ok) {
-        Serial.println("[HTTP] Upload endgültig fehlgeschlagen");
-        beepPattern(600, 80, 80, 5);
-        currentState = IDLE;
-        return;
-    }
-
-    if (finalSegment) {
-        beepPattern(1000, 80, 60, 3);   // 3 Beeps = Aufnahme abgeschlossen
-        Serial.println("[HTTP] Aufnahme abgeschlossen");
-        currentState = IDLE;
-    } else {
-        currentState = RECORDING;       // weiter aufnehmen
-    }
-    finalSegment = false;
 }
 
 // =============================================================================
@@ -463,21 +470,25 @@ void setup() {
     psramBufInit();
     audioQueuesInit();
 
-    // INPUT statt INPUT_PULLUP: Hardware-Pull-up auf der Platine verwenden.
-    // 50ms warten damit der Pin eingeschwungen ist, dann echten Zustand lesen.
-    pinMode(BUTTON_PIN, INPUT);
+    uploadJobQueue = xQueueCreate(3, sizeof(UploadJob));
+    uploadDoneSem  = xSemaphoreCreateBinary();
+
+    // INPUT_PULLUP: interner Pull-up aktivieren.
+    // M5.begin() setzt den Pin bereits auf Pull-up; pinMode(INPUT) würde ihn
+    // wieder deaktivieren → GPIO bleibt nach dem Loslassen LOW → kein HIGH-Flankenwechsel.
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
     delay(50);
     _btnPrev = digitalRead(BUTTON_PIN);
     Serial.printf("[BOOT] Button GPIO %d, Startzustand: %s\n",
                   BUTTON_PIN, _btnPrev == HIGH ? "HIGH" : "LOW");
 
-    xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, nullptr, 5, nullptr, 0);
-    Serial.println("[BOOT] audioTask gestartet (Core 0)");
+    xTaskCreatePinnedToCore(audioTask,  "audioTask",  4096, nullptr, 5, nullptr, 0);
+    xTaskCreatePinnedToCore(uploadTask, "uploadTask", 8192, nullptr, 2, nullptr, 1);
+    Serial.println("[BOOT] Tasks gestartet (audioTask Core0, uploadTask Core1)");
 
-    WiFi.setSleep(false);   // VOR setupWiFi – verhindert Routing-Reset
+    WiFi.setSleep(false);
     setupWiFi();
 
-    // Kurze Pause nach WiFi-Connect: DHCP/Routing braucht manchmal einen Moment
     delay(500);
 
     bool reachable = false;
@@ -510,7 +521,7 @@ void setup() {
 // Button – direktes GPIO-Reading (umgeht M5Unified-Board-Detection)
 // =============================================================================
 void updateButton() {
-    bool raw = digitalRead(BUTTON_PIN);   // LOW = gedrückt
+    bool raw = digitalRead(BUTTON_PIN);
     _btnEvent = false;
 
     if (raw == _btnPrev) return;
@@ -518,16 +529,13 @@ void updateButton() {
     uint32_t now = millis();
 
     if (_btnPrev == HIGH && raw == LOW) {
-        // Flanke: losgelassen → gedrückt
+        // Flanke: offen → gedrückt
         _btnPressedAt = now;
     } else if (_btnPrev == LOW && raw == HIGH) {
-        // Flanke: gedrückt → losgelassen → Event auslösen
+        // Flanke: gedrückt → losgelassen
         _btnHeldMs = now - _btnPressedAt;
         _btnEvent  = true;
-        Serial.printf("[BTN] Release nach %lums\n", (unsigned long)_btnHeldMs);
-        char logMsg[48];
-        snprintf(logMsg, sizeof(logMsg), "Button Release nach %lums", (unsigned long)_btnHeldMs);
-        sendLog(logMsg);
+        // Kein sendLog hier – würde loop() bis zu 2s blockieren
     }
     _btnPrev = raw;
 }
@@ -541,6 +549,8 @@ void loop() {
 
     // --- Button-Handling -------------------------------------------------------
     if (_btnEvent) {
+        Serial.printf("[BTN] Release nach %lums\n", (unsigned long)_btnHeldMs);
+
         if (_btnHeldMs >= PORTAL_RESET_HOLD_MS && currentState == IDLE) {
             Serial.println("[BTN] WiFi-Reset");
             beepPattern(1000, 200, 100, 2);
@@ -552,7 +562,6 @@ void loop() {
             abortRecording("Langdruck");
 
         } else {
-            // Kurzer Druck: Toggle Start/Stop
             if (currentState == IDLE) {
                 beginRecording();
             } else if (currentState == RECORDING) {
@@ -563,28 +572,45 @@ void loop() {
     }
 
     // --- Audio in PSRAM schreiben (RECORDING) ----------------------------------
-    if (currentState == RECORDING && psramBuf) {
+    if (currentState == RECORDING && psramBuf[recBufIdx]) {
         int16_t* buf;
         while (xQueueReceive(filledQueue, &buf, 0) == pdTRUE) {
-            if (psramLen + AUDIO_BUF_BYTES <= PSRAM_SEG_SIZE) {
-                memcpy(psramBuf + psramLen, buf, AUDIO_BUF_BYTES);
-                psramLen += AUDIO_BUF_BYTES;
+            if (psramLen[recBufIdx] + AUDIO_BUF_BYTES <= PSRAM_SEG_SIZE) {
+                memcpy(psramBuf[recBufIdx] + psramLen[recBufIdx], buf, AUDIO_BUF_BYTES);
+                psramLen[recBufIdx] += AUDIO_BUF_BYTES;
             }
             xQueueSend(freeQueue, &buf, 0);
         }
 
-        // Segmentgrenze erreicht → automatisch hochladen
-        if (psramLen >= SEGMENT_BYTES) {
-            Serial.printf("[REC] Segment voll (%lu KB) – Upload\n",
-                          (unsigned long)(psramLen / 1024));
-            finalSegment = false;
-            currentState = UPLOADING;
+        // Segmentgrenze → Puffer wechseln, Upload starten
+        if (psramLen[recBufIdx] >= SEGMENT_BYTES) {
+            int uploadBuf = recBufIdx;
+            recBufIdx     = 1 - recBufIdx;
+            psramLen[recBufIdx] = 0;
+
+            UploadJob job = { uploadBuf, seqNum++, false };
+            if (xQueueSend(uploadJobQueue, &job, pdMS_TO_TICKS(500)) != pdTRUE) {
+                // uploadTask noch beschäftigt – Segment verwerfen
+                Serial.println("[REC] WARNUNG: Upload-Queue voll – Segment verworfen");
+                psramLen[uploadBuf] = 0;
+            } else {
+                Serial.printf("[REC] Seg %d → uploadTask (Buf %d)\n", job.seq, uploadBuf);
+            }
         }
     }
 
-    // --- Segment hochladen (UPLOADING) -----------------------------------------
+    // --- Auf finalen Upload warten (UPLOADING) ---------------------------------
     if (currentState == UPLOADING) {
-        handleUploading();
+        if (xSemaphoreTake(uploadDoneSem, 0) == pdTRUE) {
+            if (uploadFinalOk) {
+                beepPattern(1000, 80, 60, 3);
+                Serial.println("[HTTP] Aufnahme vollständig hochgeladen");
+            } else {
+                beepPattern(600, 80, 80, 5);
+                Serial.println("[HTTP] Finaler Upload fehlgeschlagen");
+            }
+            currentState = IDLE;
+        }
     }
 
     delay(2);
