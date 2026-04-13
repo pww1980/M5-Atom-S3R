@@ -48,26 +48,31 @@ async def handle_connection(websocket):
     logger.info(f"[SESSION] Neue Verbindung: {session_name}")
 
     pcm_data = bytearray()
-    clean_close = False
 
     try:
         async for message in websocket:
             if isinstance(message, bytes):
+                # Audio-Chunk puffern
                 pcm_data.extend(message)
-            # Textframes ignorieren
-    except websockets.exceptions.ConnectionClosedOK:
-        clean_close = True
+            elif isinstance(message, str) and message.strip() == "DONE":
+                # Gerät signalisiert Ende der Aufnahme – Verbindung noch offen
+                break
+            # Andere Textframes ignorieren
+
     except websockets.exceptions.ConnectionClosedError:
-        clean_close = False
+        # Verbindung unerwartet getrennt (kein DONE-Frame) → verwerfen
+        logger.warning(f"[SESSION] {session_name} unerwartet getrennt – verworfen")
+        return
     except Exception as e:
         logger.error(f"[SESSION] Fehler: {e}")
-        clean_close = False
-
-    if not clean_close or len(pcm_data) == 0:
-        logger.warning(f"[SESSION] {session_name} abgebrochen oder leer – verworfen")
         return
 
-    # WAV schreiben
+    if len(pcm_data) == 0:
+        logger.warning(f"[SESSION] {session_name} leer – verworfen")
+        await websocket.close()
+        return
+
+    # WAV schreiben (Verbindung ist noch offen)
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
     wav_path = os.path.join(config.OUTPUT_DIR, f"{session_name}_audio.wav")
 
@@ -77,11 +82,9 @@ async def handle_connection(websocket):
 
     logger.info(f"[SESSION] WAV geschrieben: {wav_path} ({len(pcm_data)} Bytes PCM)")
 
-    # ACK zurück an Device
-    try:
-        await websocket.send("ACK")
-    except Exception:
-        pass
+    # ACK senden – Verbindung ist noch offen, Gerät wartet darauf
+    await websocket.send("ACK")
+    await websocket.close()
 
     # In Pipeline-Queue einreihen
     await pipeline_queue.put(wav_path)

@@ -274,8 +274,10 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
             if (currentState == RECORDING) currentState = RECONNECTING;
             break;
         case WStype_TEXT:
-            if (length >= 3 && strncmp((char*)payload, "ACK", 3) == 0)
+            if (length >= 3 && strncmp((char*)payload, "ACK", 3) == 0) {
                 wsAckReceived = true;
+                ws.disconnect();    // Server hat bestätigt → Verbindung sauber schließen
+            }
             break;
         default: break;
     }
@@ -385,6 +387,7 @@ void setup() {
 bool          lastButtonState  = HIGH;
 unsigned long pressStartMillis = 0;
 bool          longPressHandled = false;
+unsigned long processingStart  = 0;
 
 void loop() {
     M5.update();
@@ -445,11 +448,12 @@ void loop() {
 
         } else if (currentState == RECORDING) {
             Serial.println("[BTN] Stopp Aufnahme");
-            stopCapture();              // audioTask pausiert, Mic aus, Speaker an
-            ws.disconnect();
+            stopCapture();                  // audioTask pausiert, Mic aus, Speaker an
+            ws.sendTXT("DONE");             // Server signalisieren – Verbindung OFFEN lassen
             beepPattern(1000, 80, 60, 3);   // 3× 1000 Hz → Verarbeitung läuft
-            wsAckReceived = false;
-            currentState  = PROCESSING;
+            wsAckReceived    = false;
+            processingStart  = millis();
+            currentState     = PROCESSING;
         }
     }
     lastButtonState = btn;
@@ -469,8 +473,17 @@ void loop() {
         handleReconnecting();
 
     // ---- Warten auf ACK (PROCESSING) ----
-    if (currentState == PROCESSING && wsAckReceived) {
-        Serial.println("[PIPELINE] Server hat Job übernommen");
-        currentState = IDLE;
+    if (currentState == PROCESSING) {
+        if (wsAckReceived) {
+            Serial.println("[PIPELINE] Server hat Job übernommen");
+            currentState = IDLE;
+        } else if (millis() - processingStart > 15000) {
+            // Nach 15 s kein ACK → Server hat vermutlich trotzdem empfangen,
+            // Verbindung trennen und in IDLE gehen
+            Serial.println("[PIPELINE] ACK-Timeout – gehe zu IDLE");
+            ws.disconnect();
+            beepPattern(600, 80, 80, 2);    // 2× kurz 600 Hz → unsicherer Abschluss
+            currentState = IDLE;
+        }
     }
 }
