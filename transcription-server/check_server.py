@@ -64,18 +64,23 @@ def check_tcp(host: str, port: int) -> bool:
 
 # --- 2. WebSocket-Handshake + ACK -------------------------------------------
 async def _ws_roundtrip(host: str, port: int) -> tuple[bool, bool]:
-    """Verbindet per WebSocket, sendet minimale PCM-Stille, erwartet ACK."""
+    """Verbindet per WebSocket, sendet PCM-Stille + DONE-Frame, erwartet ACK.
+
+    Das Gerät sendet DONE (kein WebSocket-Close-Frame) – erst danach schickt
+    der Server ACK und schließt die Verbindung.  Der Close-Frame-Pfad sendet
+    bewusst kein ACK (Verbindung ist bereits halb geschlossen).
+    """
     uri = f"ws://{host}:{port}"
     hs_ok  = False
     ack_ok = False
     try:
         async with websockets.connect(uri, open_timeout=5) as ws:
             hs_ok = True
-            # 512 Samples × 2 Bytes Stille = 1 KB (ein einziger Chunk)
+            # 512 Samples × 2 Bytes Stille = 1 KB (entspricht einem echten Chunk)
             silence = b"\x00" * 1024
             await ws.send(silence)
-            # Sauber schließen → Server soll WAV schreiben + ACK senden
-            await ws.close()
+            # DONE senden → Server schreibt WAV, sendet ACK, schließt dann selbst
+            await ws.send("DONE")
             # ACK mit kurzem Timeout abwarten
             try:
                 async with asyncio.timeout(8):
@@ -91,8 +96,8 @@ async def _ws_roundtrip(host: str, port: int) -> tuple[bool, bool]:
 
 def check_websocket(host: str, port: int) -> bool:
     hs_ok, ack_ok = asyncio.run(_ws_roundtrip(host, port))
-    check("WebSocket-Handshake",    hs_ok,  "Verbindung aufgebaut" if hs_ok  else "Handshake fehlgeschlagen")
-    check("Server-ACK nach Close",  ack_ok, "ACK empfangen"        if ack_ok else "kein ACK innerhalb 8 s")
+    check("WebSocket-Handshake",   hs_ok,  "Verbindung aufgebaut"  if hs_ok  else "Handshake fehlgeschlagen")
+    check("Server-ACK nach DONE",  ack_ok, "ACK empfangen"         if ack_ok else "kein ACK innerhalb 8 s")
     return hs_ok and ack_ok
 
 
