@@ -1,16 +1,21 @@
 /**
  * Atom Echo S3R – Transkriptions-Pipeline Firmware
- * M5Stack Atom Echo S3R (ESP32-S3, ES7210 Codec)
+ *
+ * Hardware:  M5Stack Atom VoiceS3R / Atom EchoS3R
+ * MCU:       ESP32-S3
+ * Codec:     ES8311  (via M5Unified)
+ * LED:       LP5562  (I2C, SDA=45, SCL=0)
+ * Button:    GPIO 41
  *
  * Zustände: IDLE → RECORDING → PROCESSING → DONE / ERROR / RECONNECTING
  */
 
+#include <M5Unified.h>
 #include <WiFi.h>
 #include <WebSocketsClient.h>
 #include <Wire.h>
-#include <driver/i2s.h>
-#include <Adafruit_NeoPixel.h>
 #include <esp_psram.h>
+#include <math.h>
 
 // =============================================================================
 // Konfigurationskonstanten
@@ -20,23 +25,70 @@
 #define SERVER_IP                   "192.168.x.x"
 #define SERVER_PORT                 8765
 
-#define I2S_SAMPLE_RATE             16000
-#define I2S_DMA_BUF_LEN            512
-#define I2S_DMA_BUF_CNT            8
-#define ES7210_I2C_ADDR             0x40
+#define AUDIO_SAMPLE_RATE           16000
+#define AUDIO_BUF_SAMPLES           512     // Samples pro Chunk
+#define AUDIO_BUF_BYTES             (AUDIO_BUF_SAMPLES * 2)
 
 #define BUTTON_PIN                  41
-#define BUTTON_DEBOUNCE             50          // ms
+#define BUTTON_DEBOUNCE_MS          50
 #define LONG_PRESS_MS               3000
-
-#define MIC_GAIN_DB                 24
 
 #define PSRAM_BUFFER_MAX_BYTES      (4 * 1024 * 1024)   // 4 MB
 #define WIFI_RECONNECT_INTERVAL_MS  2000
 #define WIFI_RECONNECT_MAX_ATTEMPTS 30
 
-#define LED_PIN                     35          // NeoPixel pin (Atom S3R)
-#define LED_COUNT                   1
+// I2C (geteilt von ES8311 und LP5562)
+#define I2C_SDA_PIN                 45
+#define I2C_SCL_PIN                 0
+
+// =============================================================================
+// LP5562 RGB-LED (I2C)
+// =============================================================================
+#define LP5562_ADDR     0x30
+
+#define LP5562_ENABLE   0x00  // [6]=CHIP_EN, [5]=LOG_EN
+#define LP5562_OP_MODE  0x01  // [7:6]=ENG3, [5:4]=ENG2, [3:2]=ENG1  (11=direct)
+#define LP5562_B_PWM    0x02
+#define LP5562_G_PWM    0x03
+#define LP5562_R_PWM    0x04
+#define LP5562_R_CUR    0x05  // Stromstärke Rot   (0xAF = ~175/255)
+#define LP5562_G_CUR    0x06
+#define LP5562_B_CUR    0x07
+#define LP5562_CONFIG   0x08  // [0]=INT_CLK_EN
+#define LP5562_RESET    0x0D  // 0xFF = Reset
+
+void lp5562Write(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(LP5562_ADDR);
+    Wire.write(reg);
+    Wire.write(val);
+    Wire.endTransmission();
+}
+
+void lp5562Init() {
+    lp5562Write(LP5562_RESET,   0xFF);
+    delay(10);
+    lp5562Write(LP5562_ENABLE,  0x40);  // CHIP_EN
+    lp5562Write(LP5562_CONFIG,  0x01);  // interner Takt
+    lp5562Write(LP5562_OP_MODE, 0xFF);  // alle Kanäle: Direct Control
+    // Stromstärke (AF hex = gemäßigter Strom, verhindert Überhitzung)
+    lp5562Write(LP5562_R_CUR,   0xAF);
+    lp5562Write(LP5562_G_CUR,   0xAF);
+    lp5562Write(LP5562_B_CUR,   0xAF);
+    // LED aus
+    lp5562Write(LP5562_R_PWM,   0x00);
+    lp5562Write(LP5562_G_PWM,   0x00);
+    lp5562Write(LP5562_B_PWM,   0x00);
+}
+
+void setLED(uint8_t r, uint8_t g, uint8_t b) {
+    lp5562Write(LP5562_R_PWM, r);
+    lp5562Write(LP5562_G_PWM, g);
+    lp5562Write(LP5562_B_PWM, b);
+}
+
+void setLEDDimmed(uint8_t r, uint8_t g, uint8_t b, uint8_t pct = 10) {
+    setLED((r * pct) / 100, (g * pct) / 100, (b * pct) / 100);
+}
 
 // =============================================================================
 // Zustände
@@ -53,238 +105,94 @@ enum State {
 State currentState = IDLE;
 
 // =============================================================================
-// LED
+// LED-Animation (non-blocking)
 // =============================================================================
-Adafruit_NeoPixel led(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
-
-void setLED(uint8_t r, uint8_t g, uint8_t b) {
-    led.setPixelColor(0, led.Color(r, g, b));
-    led.show();
-}
-
-void setLEDDimmed(uint8_t r, uint8_t g, uint8_t b, uint8_t brightness = 25) {
-    led.setPixelColor(0, led.Color(
-        (r * brightness) / 255,
-        (g * brightness) / 255,
-        (b * brightness) / 255
-    ));
-    led.show();
-}
-
-// =============================================================================
-// LED-Animationen (non-blocking via Millisekunden-Timer)
-// =============================================================================
-unsigned long ledTimer = 0;
-bool ledToggle = false;
-float ledPulse = 0.0f;
-float ledPulseDir = 0.02f;
+unsigned long ledTimer    = 0;
+bool          ledToggle   = false;
+float         ledPulse    = 0.0f;
+float         ledPulseDir = 0.02f;
 
 void updateLEDAnimation() {
     unsigned long now = millis();
     switch (currentState) {
         case IDLE:
-            setLEDDimmed(255, 255, 255, 25);
+            setLEDDimmed(255, 255, 255, 10);        // Weiß, gedimmt
             break;
+
         case RECORDING:
             if (now - ledTimer >= 500) {
-                ledTimer = now;
+                ledTimer  = now;
                 ledToggle = !ledToggle;
-                if (ledToggle) setLED(180, 0, 0);
-                else           setLED(0, 0, 0);
+                ledToggle ? setLED(180, 0, 0) : setLED(0, 0, 0);  // Rot blinkend
             }
             break;
-        case RECONNECTING:
-            // langsames Pulsieren blau
+
+        case RECONNECTING:                          // Blau pulsierend (langsam)
             if (now - ledTimer >= 20) {
-                ledTimer = now;
-                ledPulse += ledPulseDir;
+                ledTimer   = now;
+                ledPulse  += ledPulseDir;
                 if (ledPulse >= 1.0f || ledPulse <= 0.0f) ledPulseDir = -ledPulseDir;
-                uint8_t b = (uint8_t)(ledPulse * 180);
-                setLED(0, 0, b);
+                setLED(0, 0, (uint8_t)(ledPulse * 150));
             }
             break;
-        case PROCESSING:
+
+        case PROCESSING:                            // Gelb pulsierend
             if (now - ledTimer >= 20) {
-                ledTimer = now;
-                ledPulse += ledPulseDir;
+                ledTimer   = now;
+                ledPulse  += ledPulseDir;
                 if (ledPulse >= 1.0f || ledPulse <= 0.0f) ledPulseDir = -ledPulseDir;
                 uint8_t y = (uint8_t)(ledPulse * 200);
                 setLED(y, y, 0);
             }
             break;
+
         case DONE:
-            setLED(0, 200, 0);
+            setLED(0, 180, 0);                      // Grün
             break;
+
         case ERROR_STATE:
             if (now - ledTimer >= 200) {
-                ledTimer = now;
+                ledTimer  = now;
                 ledToggle = !ledToggle;
-                if (ledToggle) setLED(0, 0, 200);
-                else           setLED(0, 0, 0);
+                ledToggle ? setLED(0, 0, 200) : setLED(0, 0, 0); // Blau schnell
             }
             break;
     }
 }
 
 // =============================================================================
-// Pieptöne (I2S TX, nur außerhalb RECORDING)
+// Pieptöne (M5.Speaker, nur außerhalb RECORDING)
 // =============================================================================
-#define I2S_TX_PORT     I2S_NUM_1
-
-void i2sTxInit() {
-    i2s_config_t cfg = {
-        .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate          = I2S_SAMPLE_RATE,
-        .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count        = 4,
-        .dma_buf_len          = 256,
-        .use_apll             = false,
-        .tx_desc_auto_clear   = true,
-    };
-    i2s_pin_config_t pins = {
-        .bck_io_num   = 5,
-        .ws_io_num    = 6,
-        .data_out_num = 38,
-        .data_in_num  = I2S_PIN_NO_CHANGE
-    };
-    i2s_driver_install(I2S_TX_PORT, &cfg, 0, NULL);
-    i2s_set_pin(I2S_TX_PORT, &pins);
-}
-
-void beep(uint16_t freqHz, uint32_t durationMs) {
-    const uint32_t sampleRate = I2S_SAMPLE_RATE;
-    const uint32_t totalSamples = (sampleRate * durationMs) / 1000;
-    const uint32_t chunkSamples = 256;
-    int16_t buf[chunkSamples];
-
-    uint32_t sampleCount = 0;
-    float phase = 0.0f;
-    float phaseStep = 2.0f * M_PI * freqHz / (float)sampleRate;
-
-    // Envelope: 10ms fade-in / 10ms fade-out
-    uint32_t fadeLen = (sampleRate * 10) / 1000;
-
-    while (sampleCount < totalSamples) {
-        uint32_t chunk = min((uint32_t)chunkSamples, totalSamples - sampleCount);
-        for (uint32_t i = 0; i < chunk; i++) {
-            float env = 1.0f;
-            if (sampleCount + i < fadeLen)
-                env = (float)(sampleCount + i) / fadeLen;
-            else if (sampleCount + i > totalSamples - fadeLen)
-                env = (float)(totalSamples - sampleCount - i) / fadeLen;
-            buf[i] = (int16_t)(sinf(phase) * 20000.0f * env);
-            phase += phaseStep;
-            if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
-        }
-        size_t written = 0;
-        i2s_write(I2S_TX_PORT, buf, chunk * 2, &written, portMAX_DELAY);
-        sampleCount += chunk;
-    }
-    // Flush silence
-    memset(buf, 0, sizeof(buf));
-    size_t written = 0;
-    i2s_write(I2S_TX_PORT, buf, chunkSamples * 2, &written, 100);
-}
-
 void beepPattern(uint16_t freqHz, uint32_t tonMs, uint32_t pauseMs, uint8_t count) {
     for (uint8_t i = 0; i < count; i++) {
-        beep(freqHz, tonMs);
+        M5.Speaker.tone(freqHz, tonMs);
+        delay(tonMs);
+        M5.Speaker.stop();
         if (i < count - 1) delay(pauseMs);
     }
 }
 
 // =============================================================================
-// ES7210 Initialisierung
-// =============================================================================
-void es7210WriteReg(uint8_t reg, uint8_t val) {
-    Wire.beginTransmission(ES7210_I2C_ADDR);
-    Wire.write(reg);
-    Wire.write(val);
-    Wire.endTransmission();
-}
-
-void es7210Init() {
-    Wire.begin();
-    delay(10);
-    // Reset
-    es7210WriteReg(0x00, 0xFF);
-    delay(20);
-    es7210WriteReg(0x00, 0x41);
-    delay(10);
-    // Clock / sample rate 16 kHz
-    es7210WriteReg(0x01, 0x20);
-    es7210WriteReg(0x02, 0x00);
-    es7210WriteReg(0x06, 0x00);
-    es7210WriteReg(0x07, 0x20);
-    // Mono, 16 Bit
-    es7210WriteReg(0x11, 0x60);
-    // MIC gain 24 dB
-    uint8_t gainVal = 0x00;
-    if (MIC_GAIN_DB >= 30) gainVal = 0x05;
-    else if (MIC_GAIN_DB >= 27) gainVal = 0x04;
-    else if (MIC_GAIN_DB >= 24) gainVal = 0x03;
-    else gainVal = 0x02;
-    es7210WriteReg(0x43, gainVal);  // MIC1
-    es7210WriteReg(0x44, gainVal);  // MIC2
-    // Power up
-    es7210WriteReg(0x0B, 0xFF);
-    es7210WriteReg(0x0C, 0xFF);
-    delay(20);
-}
-
-// =============================================================================
-// I2S RX (Mikrofon)
-// =============================================================================
-#define I2S_RX_PORT     I2S_NUM_0
-
-void i2sRxInit() {
-    i2s_config_t cfg = {
-        .mode                 = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-        .sample_rate          = I2S_SAMPLE_RATE,
-        .bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format       = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags     = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count        = I2S_DMA_BUF_CNT,
-        .dma_buf_len          = I2S_DMA_BUF_LEN,
-        .use_apll             = false,
-        .tx_desc_auto_clear   = false,
-    };
-    i2s_pin_config_t pins = {
-        .bck_io_num   = 5,
-        .ws_io_num    = 6,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num  = 39
-    };
-    i2s_driver_install(I2S_RX_PORT, &cfg, 0, NULL);
-    i2s_set_pin(I2S_RX_PORT, &pins);
-}
-
-void i2sRxStop() {
-    i2s_stop(I2S_RX_PORT);
-    i2s_driver_uninstall(I2S_RX_PORT);
-}
-
-// =============================================================================
 // PSRAM-Ringpuffer
 // =============================================================================
-uint8_t* psramBuf = nullptr;
-uint32_t psramHead = 0;    // Schreibzeiger
-uint32_t psramTail = 0;    // Lesezeiger
+uint8_t* psramBuf  = nullptr;
+uint32_t psramHead = 0;
+uint32_t psramTail = 0;
 uint32_t psramUsed = 0;
 
 void psramBufInit() {
+    if (!psramFound()) { Serial.println("[PSRAM] Nicht verfügbar"); return; }
     psramBuf = (uint8_t*)ps_malloc(PSRAM_BUFFER_MAX_BYTES);
-    psramHead = psramTail = psramUsed = 0;
+    if (!psramBuf) Serial.println("[PSRAM] Allokierung fehlgeschlagen");
+    else           Serial.printf("[PSRAM] %d MB reserviert\n", PSRAM_BUFFER_MAX_BYTES / (1024*1024));
 }
 
+void psramBufReset() { psramHead = psramTail = psramUsed = 0; }
+
 void psramBufWrite(const uint8_t* data, uint32_t len) {
+    if (!psramBuf) return;
     for (uint32_t i = 0; i < len; i++) {
         if (psramUsed >= PSRAM_BUFFER_MAX_BYTES) {
-            // Älteste Bytes verwerfen (Ringpuffer)
             psramTail = (psramTail + 1) % PSRAM_BUFFER_MAX_BYTES;
             psramUsed--;
         }
@@ -295,9 +203,10 @@ void psramBufWrite(const uint8_t* data, uint32_t len) {
 }
 
 uint32_t psramBufRead(uint8_t* out, uint32_t maxLen) {
-    uint32_t n = min(maxLen, psramUsed);
+    if (!psramBuf) return 0;
+    uint32_t n = (psramUsed < maxLen) ? psramUsed : maxLen;
     for (uint32_t i = 0; i < n; i++) {
-        out[i] = psramBuf[psramTail];
+        out[i]   = psramBuf[psramTail];
         psramTail = (psramTail + 1) % PSRAM_BUFFER_MAX_BYTES;
     }
     psramUsed -= n;
@@ -308,7 +217,7 @@ uint32_t psramBufRead(uint8_t* out, uint32_t maxLen) {
 // WebSocket
 // =============================================================================
 WebSocketsClient ws;
-bool wsConnected = false;
+bool wsConnected   = false;
 bool wsAckReceived = false;
 
 void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
@@ -320,17 +229,13 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_DISCONNECTED:
             wsConnected = false;
             Serial.println("[WS] Getrennt");
-            if (currentState == RECORDING) {
-                currentState = RECONNECTING;
-            }
+            if (currentState == RECORDING) currentState = RECONNECTING;
             break;
         case WStype_TEXT:
-            if (strncmp((char*)payload, "ACK", 3) == 0) {
+            if (length >= 3 && strncmp((char*)payload, "ACK", 3) == 0)
                 wsAckReceived = true;
-            }
             break;
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -338,12 +243,8 @@ bool wsConnect() {
     ws.begin(SERVER_IP, SERVER_PORT, "/");
     ws.onEvent(wsEvent);
     ws.setReconnectInterval(0);
-    // Warte bis zu 3 Sekunden auf Verbindung
     unsigned long t = millis();
-    while (!wsConnected && millis() - t < 3000) {
-        ws.loop();
-        delay(10);
-    }
+    while (!wsConnected && millis() - t < 3000) { ws.loop(); delay(10); }
     return wsConnected;
 }
 
@@ -351,58 +252,54 @@ bool wsConnect() {
 // Server-Erreichbarkeitstest (TCP-only)
 // =============================================================================
 bool serverReachable() {
-    WiFiClient client;
-    return client.connect(SERVER_IP, SERVER_PORT, 2000);
+    WiFiClient c;
+    bool ok = c.connect(SERVER_IP, SERVER_PORT, 2000);
+    c.stop();
+    return ok;
 }
-
-// =============================================================================
-// Button-Logik
-// =============================================================================
-bool lastButtonState = HIGH;
-unsigned long pressStart = 0;
-bool longPressHandled = false;
-
-// =============================================================================
-// Audio-Chunk-Buffer (Stack)
-// =============================================================================
-#define CHUNK_BYTES (I2S_DMA_BUF_LEN * 2)
-int16_t audioChunk[I2S_DMA_BUF_LEN];
 
 // =============================================================================
 // Reconnect-Logik
 // =============================================================================
-int reconnectAttempts = 0;
-unsigned long lastReconnectAttempt = 0;
+int           reconnectAttempts   = 0;
+unsigned long lastReconnectMillis = 0;
+int16_t       audioBuf[AUDIO_BUF_SAMPLES];
 
 void handleReconnecting() {
+    // Aufnahme weiterlaufen lassen, in PSRAM puffern
+    if (M5.Mic.record(audioBuf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, false))
+        psramBufWrite((uint8_t*)audioBuf, AUDIO_BUF_BYTES);
+
     unsigned long now = millis();
-    if (now - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL_MS) {
-        lastReconnectAttempt = now;
-        reconnectAttempts++;
-        Serial.printf("[RECONNECT] Versuch %d/%d\n", reconnectAttempts, WIFI_RECONNECT_MAX_ATTEMPTS);
+    if (now - lastReconnectMillis < WIFI_RECONNECT_INTERVAL_MS) return;
+    lastReconnectMillis = now;
+    reconnectAttempts++;
+    Serial.printf("[RECONNECT] Versuch %d/%d\n", reconnectAttempts, WIFI_RECONNECT_MAX_ATTEMPTS);
 
-        if (WiFi.status() != WL_CONNECTED) {
-            WiFi.reconnect();
-        } else if (wsConnect()) {
-            // PSRAM-Puffer zuerst senden
-            uint8_t tmpBuf[CHUNK_BYTES];
-            uint32_t n;
-            while ((n = psramBufRead(tmpBuf, CHUNK_BYTES)) > 0) {
-                ws.sendBIN(tmpBuf, n);
-                ws.loop();
-            }
-            currentState = RECORDING;
-            reconnectAttempts = 0;
-            Serial.println("[RECONNECT] Wiederverbunden, Puffer gesendet");
-        }
+    if (WiFi.status() != WL_CONNECTED) WiFi.reconnect();
 
-        if (reconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
-            Serial.println("[RECONNECT] Timeout – Aufnahme abgebrochen");
-            i2sRxStop();
-            currentState = IDLE;
-            reconnectAttempts = 0;
-            beepPattern(600, 80, 80, 5);
+    if (WiFi.status() == WL_CONNECTED && wsConnect()) {
+        // PSRAM-Puffer zuerst senden
+        uint8_t tmp[AUDIO_BUF_BYTES];
+        uint32_t n;
+        while ((n = psramBufRead(tmp, AUDIO_BUF_BYTES)) > 0) {
+            ws.sendBIN(tmp, n);
+            ws.loop();
         }
+        currentState      = RECORDING;
+        reconnectAttempts = 0;
+        Serial.println("[RECONNECT] Wiederverbunden");
+        return;
+    }
+
+    if (reconnectAttempts >= WIFI_RECONNECT_MAX_ATTEMPTS) {
+        Serial.println("[RECONNECT] Timeout");
+        M5.Mic.end();
+        M5.Speaker.begin();
+        beepPattern(600, 80, 80, 5);
+        setLED(0, 0, 0);
+        currentState      = IDLE;
+        reconnectAttempts = 0;
     }
 }
 
@@ -411,47 +308,38 @@ void handleReconnecting() {
 // =============================================================================
 void setup() {
     Serial.begin(115200);
-    delay(500);
-    Serial.println("[BOOT] Atom Echo S3R startet...");
+    delay(300);
 
-    // LED initialisieren
-    led.begin();
-    led.setBrightness(255);
+    // M5Unified initialisieren (verwaltet ES8311, I2S, I2C intern)
+    auto cfg = M5.config();
+    M5.begin(cfg);
+
+    // LP5562 LED-Treiber initialisieren
+    // Wire wurde von M5.begin() mit SDA=45, SCL=0 gestartet
+    lp5562Init();
     setLED(0, 0, 0);
+    Serial.println("[BOOT] LP5562 LED OK");
 
     // Button
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
     // PSRAM
-    if (psramFound()) {
-        psramBufInit();
-        Serial.println("[BOOT] PSRAM OK");
-    } else {
-        Serial.println("[BOOT] WARN: PSRAM nicht gefunden");
-    }
+    psramBufInit();
+
+    // Speaker vorbereiten (für Pieptöne)
+    M5.Speaker.setVolume(200);
+    M5.Speaker.begin();
 
     // WiFi
-    Serial.printf("[BOOT] Verbinde mit %s...\n", WIFI_SSID);
+    Serial.printf("[BOOT] Verbinde mit %s ...\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     unsigned long wt = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - wt < 15000) {
-        delay(250);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[BOOT] WiFi OK, IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
+    while (WiFi.status() != WL_CONNECTED && millis() - wt < 15000) delay(250);
+
+    if (WiFi.status() == WL_CONNECTED)
+        Serial.printf("[BOOT] WiFi OK – IP: %s\n", WiFi.localIP().toString().c_str());
+    else
         Serial.println("[BOOT] WiFi FEHLER");
-    }
-
-    // ES7210
-    es7210Init();
-    Serial.println("[BOOT] ES7210 OK");
-
-    // I2S TX (Pieptöne)
-    i2sTxInit();
-
-    // I2S RX (Mikrofon) – initialisieren, aber erst bei Aufnahme nutzen
-    i2sRxInit();
 
     // Server-Erreichbarkeit
     if (serverReachable()) {
@@ -472,101 +360,103 @@ void setup() {
 // =============================================================================
 // Loop
 // =============================================================================
+bool          lastButtonState  = HIGH;
+unsigned long pressStartMillis = 0;
+bool          longPressHandled = false;
+
 void loop() {
+    M5.update();
     ws.loop();
     updateLEDAnimation();
 
-    // --- Button lesen ---
+    // ---- Button lesen ----
     bool btn = digitalRead(BUTTON_PIN);
     unsigned long now = millis();
 
+    // Flanke: gedrückt
     if (btn == LOW && lastButtonState == HIGH) {
-        // Flanke: gedrückt
-        pressStart = now;
-        longPressHandled = false;
-        delay(BUTTON_DEBOUNCE);
-        if (digitalRead(BUTTON_PIN) == HIGH) goto skipButton;
+        delay(BUTTON_DEBOUNCE_MS);
+        if (digitalRead(BUTTON_PIN) == LOW) {
+            pressStartMillis = millis();
+            longPressHandled = false;
+        }
     }
 
-    // Langer Druck während RECORDING → abbrechen
+    // Langer Druck während RECORDING → Abbruch
     if (btn == LOW && !longPressHandled && currentState == RECORDING) {
-        if (now - pressStart >= LONG_PRESS_MS) {
+        if (millis() - pressStartMillis >= LONG_PRESS_MS) {
             longPressHandled = true;
             Serial.println("[BTN] Langer Druck – Aufnahme abgebrochen");
+            M5.Mic.end();
             ws.disconnect();
-            i2sRxStop();
+            M5.Speaker.begin();
             currentState = IDLE;
         }
     }
 
+    // Loslassen nach kurzem Druck
     if (btn == HIGH && lastButtonState == LOW && !longPressHandled) {
-        // Loslassen nach kurzem Druck
+
         if (currentState == IDLE) {
             Serial.println("[BTN] Start Aufnahme");
-            // I2S RX starten
-            i2sRxInit();
+            M5.Speaker.end();   // Lautsprecher aus, bevor Mikrofon startet
+            auto mic_cfg            = M5.Mic.config();
+            mic_cfg.sample_rate     = AUDIO_SAMPLE_RATE;
+            mic_cfg.stereo          = false;
+            mic_cfg.dma_buf_count   = 8;
+            mic_cfg.dma_buf_len     = AUDIO_BUF_SAMPLES;
+            M5.Mic.config(mic_cfg);
+            M5.Mic.begin();
+
             if (wsConnect()) {
-                beep(1000, 100);
-                currentState = RECORDING;
-                psramHead = psramTail = psramUsed = 0;
-                reconnectAttempts = 0;
+                M5.Speaker.begin();
+                beepPattern(1000, 100, 0, 1);
+                M5.Speaker.end();
+                psramBufReset();
+                reconnectAttempts   = 0;
+                lastReconnectMillis = 0;
+                currentState        = RECORDING;
             } else {
-                i2sRxStop();
                 Serial.println("[BTN] WebSocket Verbindung fehlgeschlagen");
+                M5.Mic.end();
+                M5.Speaker.begin();
                 currentState = ERROR_STATE;
                 delay(3000);
                 currentState = IDLE;
             }
+
         } else if (currentState == RECORDING) {
             Serial.println("[BTN] Stopp Aufnahme");
             // Letzten Chunk senden
-            size_t bytesRead = 0;
-            i2s_read(I2S_RX_PORT, audioChunk, CHUNK_BYTES, &bytesRead, 100);
-            if (bytesRead > 0 && wsConnected) {
-                ws.sendBIN((uint8_t*)audioChunk, bytesRead);
-            }
-            i2sRxStop();
+            if (M5.Mic.record(audioBuf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, false) && wsConnected)
+                ws.sendBIN((uint8_t*)audioBuf, AUDIO_BUF_BYTES);
+            M5.Mic.end();
             ws.disconnect();
             delay(100);
+            M5.Speaker.begin();
             beepPattern(1000, 80, 60, 3);
-            currentState = PROCESSING;
             wsAckReceived = false;
+            currentState  = PROCESSING;
         }
     }
-
-    skipButton:
     lastButtonState = btn;
 
-    // --- Audio streamen (RECORDING) ---
+    // ---- Audio streamen (RECORDING) ----
     if (currentState == RECORDING && wsConnected) {
-        size_t bytesRead = 0;
-        esp_err_t err = i2s_read(I2S_RX_PORT, audioChunk, CHUNK_BYTES, &bytesRead, 10);
-        if (err == ESP_OK && bytesRead > 0) {
-            ws.sendBIN((uint8_t*)audioChunk, bytesRead);
-        }
+        if (M5.Mic.record(audioBuf, AUDIO_BUF_SAMPLES, AUDIO_SAMPLE_RATE, false))
+            ws.sendBIN((uint8_t*)audioBuf, AUDIO_BUF_BYTES);
     }
 
-    // --- Puffern bei RECONNECTING ---
-    if (currentState == RECONNECTING) {
-        size_t bytesRead = 0;
-        i2s_read(I2S_RX_PORT, audioChunk, CHUNK_BYTES, &bytesRead, 10);
-        if (bytesRead > 0 && psramBuf != nullptr) {
-            psramBufWrite((uint8_t*)audioChunk, bytesRead);
-        }
+    // ---- Puffern + Reconnect (RECONNECTING) ----
+    if (currentState == RECONNECTING)
         handleReconnecting();
-    }
 
-    // --- Warten auf ACK (PROCESSING) ---
-    if (currentState == PROCESSING) {
-        if (wsAckReceived) {
-            currentState = DONE;
-            // DONE: 2 Sekunden grün, dann IDLE
-            unsigned long doneStart = millis();
-            while (millis() - doneStart < 2000) {
-                updateLEDAnimation();
-                delay(10);
-            }
-            currentState = IDLE;
-        }
+    // ---- Warten auf ACK (PROCESSING) ----
+    if (currentState == PROCESSING && wsAckReceived) {
+        currentState = DONE;
+        unsigned long doneStart = millis();
+        while (millis() - doneStart < 2000) { updateLEDAnimation(); delay(10); }
+        setLED(0, 0, 0);
+        currentState = IDLE;
     }
 }
