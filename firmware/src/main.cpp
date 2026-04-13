@@ -80,6 +80,14 @@ static uint32_t  psramLen = 0;        // aktuell belegte Bytes
 // Session / Upload
 // =============================================================================
 static char sessionId[32] = "";
+
+// =============================================================================
+// Button-Zustand (muss vor setup() deklariert sein)
+// =============================================================================
+static bool     _btnPrev      = HIGH;  // wird in setup() mit echtem GPIO-Zustand überschrieben
+static uint32_t _btnPressedAt = 0;
+static bool     _btnEvent     = false;
+static uint32_t _btnHeldMs    = 0;
 static int  seqNum        = 0;
 static bool finalSegment  = false;
 
@@ -501,11 +509,6 @@ void setup() {
 // =============================================================================
 // Button – direktes GPIO-Reading (umgeht M5Unified-Board-Detection)
 // =============================================================================
-static bool     _btnPrev      = HIGH;  // wird in setup() mit echtem Zustand überschrieben
-static uint32_t _btnPressedAt = 0;
-static bool     _btnEvent     = false;
-static uint32_t _btnHeldMs    = 0;
-
 void updateButton() {
     bool raw = digitalRead(BUTTON_PIN);   // LOW = gedrückt
     _btnEvent = false;
