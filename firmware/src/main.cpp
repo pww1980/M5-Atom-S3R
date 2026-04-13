@@ -444,8 +444,13 @@ void setup() {
     psramBufInit();
     audioQueuesInit();
 
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-    Serial.printf("[BOOT] Button GPIO %d konfiguriert\n", BUTTON_PIN);
+    // INPUT statt INPUT_PULLUP: Hardware-Pull-up auf der Platine verwenden.
+    // 50ms warten damit der Pin eingeschwungen ist, dann echten Zustand lesen.
+    pinMode(BUTTON_PIN, INPUT);
+    delay(50);
+    _btnPrev = digitalRead(BUTTON_PIN);
+    Serial.printf("[BOOT] Button GPIO %d, Startzustand: %s\n",
+                  BUTTON_PIN, _btnPrev == HIGH ? "HIGH (nicht gedrückt)" : "LOW (gedrückt?)");
 
     xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, nullptr, 5, nullptr, 0);
     Serial.println("[BOOT] audioTask gestartet (Core 0)");
@@ -481,7 +486,7 @@ void setup() {
 // =============================================================================
 // Button – direktes GPIO-Reading (umgeht M5Unified-Board-Detection)
 // =============================================================================
-static bool     _btnPrev      = HIGH;
+static bool     _btnPrev      = HIGH;  // wird in setup() mit echtem Zustand überschrieben
 static uint32_t _btnPressedAt = 0;
 static bool     _btnEvent     = false;
 static uint32_t _btnHeldMs    = 0;
