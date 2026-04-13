@@ -61,6 +61,11 @@ class _UploadHandler(BaseHTTPRequestHandler):
             logger.info(f"[HTTP] Gerät meldet sich: {device_ip}")
             self._respond(b'OK')
 
+        elif self.path == '/log':
+            msg = self.headers.get('X-Message', '?')
+            logger.info(f"[DEVICE] {msg}")
+            self._respond(b'OK')
+
         elif self.path == '/status':
             event      = self.headers.get('X-Event', '?')
             session_id = self.headers.get('X-Session-Id', '?')
