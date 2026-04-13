@@ -292,6 +292,17 @@ void sendHello() {
     http.end();
 }
 
+void sendLog(const char* msg) {
+    char url[80];
+    snprintf(url, sizeof(url), "http://%s:%d/log", serverIP, SERVER_PORT);
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("X-Message", msg);
+    http.setTimeout(2000);
+    http.GET();
+    http.end();
+}
+
 void sendStatus(const char* event) {
     char url[80];
     snprintf(url, sizeof(url), "http://%s:%d/status", serverIP, SERVER_PORT);
@@ -450,7 +461,7 @@ void setup() {
     delay(50);
     _btnPrev = digitalRead(BUTTON_PIN);
     Serial.printf("[BOOT] Button GPIO %d, Startzustand: %s\n",
-                  BUTTON_PIN, _btnPrev == HIGH ? "HIGH (nicht gedrückt)" : "LOW (gedrückt?)");
+                  BUTTON_PIN, _btnPrev == HIGH ? "HIGH" : "LOW");
 
     xTaskCreatePinnedToCore(audioTask, "audioTask", 4096, nullptr, 5, nullptr, 0);
     Serial.println("[BOOT] audioTask gestartet (Core 0)");
@@ -473,6 +484,10 @@ void setup() {
     if (reachable) {
         Serial.println("[BOOT] Server erreichbar");
         sendHello();
+        char logMsg[64];
+        snprintf(logMsg, sizeof(logMsg), "Boot OK – Button GPIO %d Startzustand: %s",
+                 BUTTON_PIN, _btnPrev == HIGH ? "HIGH" : "LOW");
+        sendLog(logMsg);
         beepPattern(1000, 80, 80, 2);
     } else {
         Serial.println("[BOOT] Server NICHT erreichbar");
@@ -507,6 +522,9 @@ void updateButton() {
         _btnHeldMs = now - _btnPressedAt;
         _btnEvent  = true;
         Serial.printf("[BTN] Release nach %lums\n", (unsigned long)_btnHeldMs);
+        char logMsg[48];
+        snprintf(logMsg, sizeof(logMsg), "Button Release nach %lums", (unsigned long)_btnHeldMs);
+        sendLog(logMsg);
     }
     _btnPrev = raw;
 }
