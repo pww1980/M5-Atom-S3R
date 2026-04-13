@@ -26,6 +26,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Unterdrücke harmlose "connection closed before HTTP request" Traces vom
+# websockets-Library – passiert wenn der ESP32 intern eine TCP-Verbindung
+# abbricht und sofort neu verbindet (normales Retry-Verhalten).
+class _WsHandshakeFilter(logging.Filter):
+    _SUPPRESSED = (
+        "did not receive a valid HTTP request",
+        "connection closed while reading HTTP request line",
+    )
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(s in msg for s in self._SUPPRESSED)
+
+logging.getLogger("websockets.server").addFilter(_WsHandshakeFilter())
+logging.getLogger("websockets.asyncio.server").addFilter(_WsHandshakeFilter())
+
 
 # =============================================================================
 # Graceful Shutdown

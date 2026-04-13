@@ -53,7 +53,7 @@ def _build_wav_header(pcm_len: int) -> bytes:
 
 
 async def handle_connection(websocket):
-    session_name = datetime.now().strftime("%Y_%m_%d_%H_%M")
+    session_name = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     logger.info(f"[SESSION] Neue Verbindung: {session_name}")
 
     pcm_data   = bytearray()
