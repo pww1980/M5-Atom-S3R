@@ -435,7 +435,19 @@ void setup() {
     WiFi.setSleep(false);   // VOR setupWiFi – verhindert Routing-Reset
     setupWiFi();
 
-    if (serverReachable()) {
+    // Kurze Pause nach WiFi-Connect: DHCP/Routing braucht manchmal einen Moment
+    delay(500);
+
+    bool reachable = false;
+    for (int attempt = 1; attempt <= 5 && !reachable; attempt++) {
+        reachable = serverReachable();
+        if (!reachable) {
+            Serial.printf("[BOOT] Server nicht erreichbar (Versuch %d/5)\n", attempt);
+            delay(1000);
+        }
+    }
+
+    if (reachable) {
         Serial.println("[BOOT] Server erreichbar");
         sendHello();
         beepPattern(1000, 80, 80, 2);
