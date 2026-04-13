@@ -191,7 +191,14 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
         case WStype_DISCONNECTED:
             wsConnected = false;
             Serial.println("[WS] Getrennt");
-            if (currentState == RECORDING) currentState = RECONNECTING;
+            if (currentState == RECORDING) {
+                currentState = RECONNECTING;
+            } else if (currentState == PROCESSING && !wsAckReceived) {
+                // Verbindung verloren bevor ACK ankam – kein ACK mehr möglich.
+                // Sofort nach IDLE, nicht 30s auf Timeout warten.
+                Serial.println("[WS] Verbindung während PROCESSING verloren – IDLE");
+                currentState = IDLE;
+            }
             break;
 
         case WStype_TEXT:
@@ -411,10 +418,15 @@ void finishRecording() {
     if (wsConnected) {
         ws.sendTXT("DONE");     // Server erwartet "DONE" → schreibt WAV, sendet ACK
         ws.loop();
+        beepPattern(1000, 80, 60, 3);
+        currentState = PROCESSING;
+    } else {
+        // Keine Verbindung → DONE kann nicht gesendet werden, ACK kommt nie.
+        // Direkt nach IDLE statt 30s auf Timeout zu warten.
+        Serial.println("[BTN] Kein WS – Aufnahme verworfen");
+        beepPattern(600, 80, 80, 3);
+        currentState = IDLE;
     }
-
-    beepPattern(1000, 80, 60, 3);
-    currentState = PROCESSING;
 }
 
 void abortRecording(const char* reason) {
