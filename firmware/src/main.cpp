@@ -514,7 +514,12 @@ void setup() {
 // =============================================================================
 void loop() {
     M5.update();
-    ws.loop();
+    // ws.loop() im IDLE-Zustand NICHT aufrufen: die Library würde sonst nach
+    // dem konfigurierten reconnectInterval automatisch neue Verbindungen öffnen,
+    // obwohl keine Aufnahme läuft (leere Sessions auf dem Server).
+    if (currentState != IDLE) {
+        ws.loop();
+    }
 
     // Langer Druck im IDLE (≥5s) → WiFi-Reset
     if (currentState == IDLE && M5.BtnA.wasReleaseFor(PORTAL_RESET_HOLD_MS)) {
