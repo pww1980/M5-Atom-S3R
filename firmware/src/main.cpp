@@ -283,10 +283,21 @@ bool serverReachable() {
 void sendHello() {
     char url[80];
     snprintf(url, sizeof(url), "http://%s:%d/hello", serverIP, SERVER_PORT);
-
     HTTPClient http;
     http.begin(url);
     http.addHeader("X-Device-IP", WiFi.localIP().toString().c_str());
+    http.setTimeout(3000);
+    http.GET();
+    http.end();
+}
+
+void sendStatus(const char* event) {
+    char url[80];
+    snprintf(url, sizeof(url), "http://%s:%d/status", serverIP, SERVER_PORT);
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("X-Event",      event);
+    http.addHeader("X-Session-Id", sessionId);
     http.setTimeout(3000);
     http.GET();
     http.end();
@@ -337,6 +348,7 @@ void beginRecording() {
     Serial.println("[BTN] Aufnahme startet");
 
     snprintf(sessionId, sizeof(sessionId), "sess_%lu", (unsigned long)millis());
+    sendStatus("recording_start");
     seqNum       = 0;
     psramLen     = 0;
     finalSegment = false;
@@ -349,6 +361,7 @@ void beginRecording() {
 
 void finishRecording() {
     Serial.println("[BTN] Aufnahme stoppt");
+    sendStatus("recording_stop");
     stopCapture();
 
     // Verbleibende Chunks aus Queue noch in Puffer schreiben

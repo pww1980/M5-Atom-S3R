@@ -56,15 +56,30 @@ def _build_wav_header(pcm_len: int) -> bytes:
 class _UploadHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-        if self.path != '/hello':
+        if self.path == '/hello':
+            device_ip = self.headers.get('X-Device-IP', self.client_address[0])
+            logger.info(f"[HTTP] Gerät meldet sich: {device_ip}")
+            self._respond(b'OK')
+
+        elif self.path == '/status':
+            event      = self.headers.get('X-Event', '?')
+            session_id = self.headers.get('X-Session-Id', '?')
+            if event == 'recording_start':
+                logger.info(f"[STATUS] Aufnahme gestartet  (Session: {session_id})")
+            elif event == 'recording_stop':
+                logger.info(f"[STATUS] Aufnahme beendet   (Session: {session_id})")
+            else:
+                logger.info(f"[STATUS] {event}  (Session: {session_id})")
+            self._respond(b'OK')
+
+        else:
             self.send_error(404, 'Not Found')
-            return
-        device_ip = self.headers.get('X-Device-IP', self.client_address[0])
-        logger.info(f"[HTTP] Gerät meldet sich: {device_ip}")
+
+    def _respond(self, body: bytes):
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b'OK')
+        self.wfile.write(body)
 
     def do_POST(self):
         if self.path != '/upload':
