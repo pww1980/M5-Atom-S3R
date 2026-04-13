@@ -207,10 +207,18 @@ void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 bool wsConnect() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WS] WiFi nicht verbunden");
+        return false;
+    }
+
     wsConnected = false;
+    ws.disconnect();                        // alten Zustand sauber bereinigen
     ws.begin(serverIP, SERVER_PORT, "/");
     ws.onEvent(wsEvent);
-    ws.setReconnectInterval(0);
+    // 0 bedeutet in dieser Library-Version "sofort wiederholen" → Fehlermeldungs-Flut.
+    // 5000 ms begrenzt Wiederholversuche auf einen pro 5 Sekunden.
+    ws.setReconnectInterval(5000);
 
     unsigned long start = millis();
     while (!wsConnected && (millis() - start < WS_CONNECT_TIMEOUT_MS)) {
@@ -373,6 +381,7 @@ void beginRecording() {
     Serial.println("[BTN] Start Aufnahme");
 
     if (!wsConnect()) {
+        ws.disconnect();    // verhindert, dass ws.loop() im main loop weiter versucht
         Serial.println("[BTN] WebSocket fehlgeschlagen");
         beepPattern(600, 80, 80, 5);
         return;
@@ -486,6 +495,7 @@ void setup() {
     Serial.println("[BOOT] audioTask gestartet (Core 0)");
 
     setupWiFi();
+    WiFi.setSleep(false);   // Power-Save abschalten → kein kurzzeitiger Routenverlust
 
     if (serverReachable()) {
         Serial.println("[BOOT] Server erreichbar");
@@ -504,7 +514,12 @@ void setup() {
 // =============================================================================
 void loop() {
     M5.update();
-    ws.loop();
+    // ws.loop() im IDLE-Zustand NICHT aufrufen: die Library würde sonst nach
+    // dem konfigurierten reconnectInterval automatisch neue Verbindungen öffnen,
+    // obwohl keine Aufnahme läuft (leere Sessions auf dem Server).
+    if (currentState != IDLE) {
+        ws.loop();
+    }
 
     // Langer Druck im IDLE (≥5s) → WiFi-Reset
     if (currentState == IDLE && M5.BtnA.wasReleaseFor(PORTAL_RESET_HOLD_MS)) {
