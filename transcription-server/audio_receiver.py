@@ -153,5 +153,6 @@ async def start_server():
         config.WEBSOCKET_PORT,
         max_size=None,          # kein Limit für Nachrichtengröße
         ping_interval=None,     # kein automatisches Ping
+        close_timeout=2,        # max. 2s auf CLOSE-Antwort warten statt Standard 10s
     ):
         await asyncio.Future()  # läuft ewig
